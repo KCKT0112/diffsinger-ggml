@@ -112,46 +112,12 @@ bool Model::load(const std::string & path) {
         ctx_w = ggml_init(ip);
     }
 
-    for (int64_t i = 0; i < n_tensors; ++i) {
-        const char * name = gguf_get_tensor_name(gctx, i);
-        ggml_tensor * src = ggml_get_tensor(ctx_meta, name);
-        if (!src) continue;
-        ggml_tensor * dst = ggml_dup_tensor(ctx_w, src);
-        ggml_set_name(dst, name);
-        tensors[name] = dst;
-    }
-
-    weights_buffer = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+    auto lr = dsrt::load_gguf_weights(path, gctx, ctx_meta, ctx_w, backend, tensors);
+    weights_buffer = lr.buffer;
     if (!weights_buffer) {
-        fprintf(stderr, "[fatal] backend buffer alloc failed\n");
         gguf_free(gctx);
         ggml_free(ctx_meta);
         return false;
-    }
-
-    {
-        FILE * f = fopen(path.c_str(), "rb");
-        if (!f) {
-            fprintf(stderr, "[fatal] reopen %s failed\n", path.c_str());
-            return false;
-        }
-        const size_t data_off = gguf_get_data_offset(gctx);
-        std::vector<uint8_t> buf;
-        for (int64_t i = 0; i < n_tensors; ++i) {
-            const char * name = gguf_get_tensor_name(gctx, i);
-            ggml_tensor * dst = tensors[name];
-            size_t off = data_off + gguf_get_tensor_offset(gctx, i);
-            size_t sz  = ggml_nbytes(dst);
-            buf.resize(sz);
-            fseek(f, (long)off, SEEK_SET);
-            if (fread(buf.data(), 1, sz, f) != sz) {
-                fprintf(stderr, "[fatal] read tensor '%s' failed\n", name);
-                fclose(f);
-                return false;
-            }
-            ggml_backend_tensor_set(dst, buf.data(), 0, sz);
-        }
-        fclose(f);
     }
 
     // Mirror spec_min/spec_max to host memory for fast denorm in the sampler.

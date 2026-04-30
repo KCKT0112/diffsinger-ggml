@@ -150,6 +150,11 @@ int main(int argc, char ** argv) {
         else if (a == "--seed") seed = (uint32_t)std::strtoul(next().c_str(), nullptr, 10);
         else if (a == "--noise-scale") noise_scale = (float)std::atof(next().c_str());
         else if (a == "--backend") dsrt::set_backend_mode(next().c_str());
+        else if (a == "--precision") {
+            std::string m = next();
+            if (m == "f16" || m == "fp16") dsrt::set_precision(dsrt::Precision::F16);
+            else dsrt::set_precision(dsrt::Precision::F32);
+        }
         else if (a == "-h" || a == "--help") {
             usage();
             return 0;

@@ -48,7 +48,7 @@ static void usage() {
         "                           [--pitch-phonemes <pitch_phonemes.json>]\n"
         "                           [--spk-id N | --spk-name NAME --spk-map MAP]\n"
         "                           [--seed N] [--steps N] [--algorithm euler|midpoint|rk4]\n"
-        "                           [--mel-min X] [--mel-max X]\n"
+        "                           [--precision f32|f16] [--mel-min X] [--mel-max X]\n"
         "                           [--noise-scale X] [--backend cpu|gpu|auto]\n"
         "                           [--pitch-backend cpu|gpu]\n"
         "                           [--predict-all-variances]\n"
@@ -525,6 +525,12 @@ int main(int argc, char ** argv) {
             ds_setenv("DSGGML_BACKEND_PITCH", mode.c_str());
         }
         else if (a == "--predict-all-variances") predict_all_variances = true;
+        else if (a == "--precision") {
+            std::string mode = next();
+            if (mode == "f16" || mode == "fp16") dsrt::set_precision(dsrt::Precision::F16);
+            else if (mode == "f32" || mode == "fp32") dsrt::set_precision(dsrt::Precision::F32);
+            else { fprintf(stderr, "unknown precision: %s\n", mode.c_str()); return 2; }
+        }
         else if (a == "-h" || a == "--help") {
             usage();
             return 0;
@@ -580,12 +586,20 @@ int main(int argc, char ** argv) {
         if (segments.empty()) return 1;
 
         // Load models
+        // Diffusion models (variance, acoustic, pitch) MUST stay F32 — ODE accumulates errors.
+        // Only vocoder (feed-forward) is safe for F16.
+        auto user_precision = dsrt::get_precision();
+        dsrt::set_precision(dsrt::Precision::F32);  // Force F32 for diffusion models
+
         dsv::Model variance;
         if (!variance.load(variance_path)) return 1;
         ds::Model acoustic;
         if (!acoustic.load(acoustic_path)) return 1;
+
+        dsrt::set_precision(user_precision);  // Restore user setting for vocoder
         nsv::Model vocoder;
         if (!vocoder.load(vocoder_path)) return 1;
+        dsrt::set_precision(dsrt::Precision::F32);  // Back to F32 for pitch model
 
         // Optional pitch model
         dsp_pitch::Model pitch_model;

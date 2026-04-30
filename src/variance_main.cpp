@@ -187,6 +187,11 @@ int main(int argc, char ** argv) {
         else if (a == "--spk-id") spk_id = std::atoi(next().c_str());
         else if (a == "--seed") seed = (uint32_t)std::strtoul(next().c_str(), nullptr, 10);
         else if (a == "--backend") dsrt::set_backend_mode(next().c_str());
+        else if (a == "--precision") {
+            std::string m = next();
+            if (m == "f16" || m == "fp16") dsrt::set_precision(dsrt::Precision::F16);
+            else dsrt::set_precision(dsrt::Precision::F32);
+        }
         else if (a == "--cond-bin") cond_path = next();
         else if (a == "--frames") frames = std::atoi(next().c_str());
         else if (a == "--out") out_path = next();
