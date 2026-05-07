@@ -456,8 +456,8 @@ def main() -> int:
     ap.add_argument("--spk-name", help="speaker name from spk_map.json; overrides --spk-id")
     ap.add_argument("--spk-map", type=Path, default=REPO / "ckpt/251228_zhibin_club_acoustic_mix-ln/spk_map.json")
     ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--backend", choices=("cpu", "gpu", "auto"), default="cpu",
-                    help="ggml backend for C++ tools; gpu/auto use the best registered ggml backend when supported")
+    ap.add_argument("--backend", default="cpu",
+                    help="ggml backend for C++ tools: cpu, gpu, auto, cuda, or cuda:N")
     ap.add_argument("--steps", type=int, default=-1)
     ap.add_argument("--out", type=Path, default=Path("out.wav"))
     ap.add_argument("--vocoder-mel-min", type=float, default=-6.0)

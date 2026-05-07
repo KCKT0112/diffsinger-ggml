@@ -24,7 +24,7 @@ static void usage() {
         "  [--algorithm A]  euler|midpoint|rk4 (default: from gguf)\n"
         "  [--seed N]       PRNG seed (default 1234)\n"
         "  [--spk-id N]     speaker id for multi-speaker acoustic checkpoints\n"
-        "  [--backend cpu|gpu|auto]\n"
+        "  [--backend cpu|gpu|auto|cuda[:N]]\n"
         "  [--noise-bin P]  raw float32 [T, mel_bins] fixed noise for x_t init\n"
         "                   (overrides --seed)\n"
         "  [--dump-cond]    output encoder cond [T,H] instead of mel\n");

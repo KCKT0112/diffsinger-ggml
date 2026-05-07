@@ -15,7 +15,7 @@ static void usage() {
         "usage: diffsinger_vocoder --model <vocoder.gguf> [--inspect]\n"
         "                         [--mel-bin <mel.f32> --f0-bin <f0.f32> --frames <T> --out <wav|f32>]\n"
         "                         [--mel-base10] [--mel-min X] [--mel-max X]\n"
-        "                         [--seed N] [--noise-scale X] [--backend cpu|gpu|auto]\n"
+        "                         [--seed N] [--noise-scale X] [--backend cpu|gpu|auto|cuda[:N]]\n"
         "\n"
         "mel-bin is raw float32 [T, num_mels] row-major. f0-bin is raw float32 [T] in Hz.\n"
         "Outputs PCM16 WAV when --out ends with .wav, otherwise raw float32 samples.\n");

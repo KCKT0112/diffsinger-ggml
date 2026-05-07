@@ -37,8 +37,8 @@ static ggml_tensor * conv1d_k1_as_linear(ggml_context * ctx,
 
 static ggml_tensor * atanglu(ggml_context * ctx, ggml_tensor * x) {
     const int64_t c = x->ne[0] / 2;
-    ggml_tensor * out = ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], 0);
-    ggml_tensor * gate = ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], c * x->nb[0]);
+    ggml_tensor * out = ggml_cont(ctx, ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], 0));
+    ggml_tensor * gate = ggml_cont(ctx, ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], c * x->nb[0]));
     // Branchless atan(gate) using stock ggml ops so the graph runs on Metal/CUDA.
     // See ggml_acoustic/src/inference.cpp::atanglu for derivation.
     const float pi_half = 1.5707963267948966f;

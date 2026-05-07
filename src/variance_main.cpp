@@ -21,7 +21,7 @@ static void usage() {
         "                           [--ph2word-bin <i32> --word-dur-bin <f32> --pitch-bin <f32>]\n"
         "                           [--out-breathiness <f32> --out-voicing <f32> --out-tension <f32>]\n"
         "                           [--out-energy <f32>] [--seed <u32>]\n"
-        "                           [--backend cpu|gpu|auto]\n"
+        "                           [--backend cpu|gpu|auto|cuda[:N]]\n"
         "\n"
         "All modes are for the current word-duration variance checkpoint. Pitch must be\n"
         "provided as frame-level MIDI via --pitch-bin; this tool no longer predicts pitch.\n");

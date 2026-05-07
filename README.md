@@ -1,7 +1,7 @@
 # DiffSinger ggml Runtime
 
 Standalone C++17/ggml inference for DiffSinger singing voice synthesis.
-Supports variance, pitch, acoustic, and vocoder models with CPU and Metal backends.
+Supports variance, pitch, acoustic, and vocoder models with CPU, Metal, and CUDA backends.
 
 ## Assets
 
@@ -48,6 +48,20 @@ python3 scripts/convert_nsf_hifigan_ckpt_to_gguf.py \
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+```
+
+CUDA builds require an NVIDIA CUDA Toolkit visible to CMake:
+
+```bash
+cmake --preset cuda-release
+cmake --build --preset cuda-release
+```
+
+The same option can be used without presets:
+
+```bash
+cmake -S . -B build/cuda-release -DCMAKE_BUILD_TYPE=Release -DDSGGML_CUDA=ON
+cmake --build build/cuda-release -j
 ```
 
 ## Full Pipeline (`diffsinger_pipeline`)
@@ -101,11 +115,11 @@ instead of using the `.ds` file's `f0_seq`:
 | `--spk-map PATH` | Speaker name→id JSON (required with `--spk-name`) |
 | `--predict-all-variances` | Overwrite existing variance curves from .ds |
 | `--precision f32\|f16` | Weight precision (default: f32, see below) |
-| `--backend cpu\|gpu\|auto` | Global compute backend |
-| `--variance-backend cpu\|gpu` | Per-component backend override |
-| `--acoustic-backend cpu\|gpu` | |
-| `--vocoder-backend cpu\|gpu` | |
-| `--pitch-backend cpu\|gpu` | |
+| `--backend cpu\|gpu\|auto\|cuda[:N]` | Global compute backend |
+| `--variance-backend cpu\|gpu\|auto\|cuda[:N]` | Per-component backend override |
+| `--acoustic-backend cpu\|gpu\|auto\|cuda[:N]` | |
+| `--vocoder-backend cpu\|gpu\|auto\|cuda[:N]` | |
+| `--pitch-backend cpu\|gpu\|auto\|cuda[:N]` | |
 
 ### Precision (`--precision`)
 
@@ -122,7 +136,13 @@ already the smallest and fastest component. The GGUF files should remain F32 for
 ### Backend Notes
 
 - **CPU** (default): stable, fast on Apple Silicon (~1.8s per segment with midpoint-5)
-- **GPU** (Metal): all ops are Metal-native, but ~38s cold JIT compilation cost.
+- **GPU** (Metal/CUDA): all ops use ggml's registered GPU backend when available.
+- **CUDA**: build with `-DDSGGML_CUDA=ON` or the `cuda-release` preset, then run with
+  `--backend cuda` for device 0 or `--backend cuda:N` for device N. `--backend gpu`
+  also selects the first registered discrete GPU. CUDA builds apply local ggml
+  patches for long-output `IM2COL` and ConvTranspose1D, so the NSF-HiFiGAN
+  vocoder runs on CUDA too.
+- **Metal**: all ops are Metal-native, but ~38s cold JIT compilation cost.
   Only worthwhile for long-running servers that amortize the JIT.
   Recommended: keep vocoder on CPU regardless.
 
@@ -225,4 +245,4 @@ For debugging/validation against PyTorch:
 | `DSDIAG_VAR_RAW_OUT` | variance | Dump raw post-flow output |
 | `DSDIAG_PITCH_NOISE` | pitch | Load fixed pitch noise |
 | `DSGGML_THREADS` | all | Override CPU thread count |
-| `DSGGML_BACKEND_*` | all | Per-component backend (VARIANCE/ACOUSTIC/VOCODER/PITCH) |
+| `DSGGML_BACKEND_*` | all | Per-component backend (VARIANCE/ACOUSTIC/VOCODER/PITCH), supports `cpu`, `gpu`, `auto`, and `cuda[:N]` |

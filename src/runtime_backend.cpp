@@ -1,8 +1,10 @@
 #include "runtime_backend.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace dsrt {
@@ -29,12 +31,68 @@ static int runtime_threads() {
     return nth;
 }
 
+static std::string lower_ascii(const char * value) {
+    std::string out = value ? value : "";
+    for (char & ch : out) {
+        ch = (char)std::tolower((unsigned char)ch);
+    }
+    return out;
+}
+
+static bool all_digits(const std::string & value) {
+    if (value.empty()) return false;
+    for (char ch : value) {
+        if (ch < '0' || ch > '9') return false;
+    }
+    return true;
+}
+
+static std::string cuda_device_alias(const std::string & mode) {
+    if (mode == "cuda") return "CUDA0";
+    if (mode.rfind("cuda:", 0) == 0) {
+        std::string id = mode.substr(5);
+        return all_digits(id) ? "CUDA" + id : "";
+    }
+    if (mode.rfind("cuda", 0) == 0) {
+        std::string id = mode.substr(4);
+        return all_digits(id) ? "CUDA" + id : "";
+    }
+    return "";
+}
+
+static const char * device_type_name(enum ggml_backend_dev_type type) {
+    switch (type) {
+    case GGML_BACKEND_DEVICE_TYPE_CPU:   return "CPU";
+    case GGML_BACKEND_DEVICE_TYPE_GPU:   return "GPU";
+    case GGML_BACKEND_DEVICE_TYPE_IGPU:  return "iGPU";
+    case GGML_BACKEND_DEVICE_TYPE_ACCEL: return "accelerator";
+    case GGML_BACKEND_DEVICE_TYPE_META:  return "meta";
+    }
+    return "unknown";
+}
+
+static void print_available_devices() {
+    const size_t n = ggml_backend_dev_count();
+    if (n == 0) {
+        fprintf(stderr, "[load] no ggml backend devices are registered\n");
+        return;
+    }
+    fprintf(stderr, "[load] available ggml devices:\n");
+    for (size_t i = 0; i < n; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const char * name = ggml_backend_dev_name(dev);
+        const char * desc = ggml_backend_dev_description(dev);
+        fprintf(stderr, "  - %s (%s, %s)\n",
+                name ? name : "?",
+                desc ? desc : "?",
+                device_type_name(ggml_backend_dev_type(dev)));
+    }
+}
+
 ggml_backend_t init_backend(const char * component) {
     // Per-component override env vars take precedence over the global one.
     // e.g. DSGGML_BACKEND_VOCODER=cpu while DSGGML_BACKEND=gpu lets us run
-    // the heavy backbone+encoder on Metal but keep the vocoder on CPU
-    // (vocoder is dominated by ggml_conv_transpose_1d which currently
-    // compiles slowly on Metal and is already real-time on CPU).
+    // the variance/acoustic models on GPU while keeping the vocoder on CPU.
     const char * requested = nullptr;
     if (component) {
         char buf[128];
@@ -49,9 +107,6 @@ ggml_backend_t init_backend(const char * component) {
     if (!requested) requested = std::getenv("DSGGML_BACKEND");
     if (!requested || requested[0] == '\0') requested = "cpu";
 
-    // On Apple platforms, the vocoder's ggml_conv_transpose_1d triggers very slow
-    // Metal kernel JIT and can hang.  Force CPU unless the user explicitly set
-    // DSGGML_BACKEND_VOCODER=gpu (per-component override already resolved above).
 #if defined(__APPLE__)
     if (component && std::strcmp(component, "vocoder") == 0) {
         // Only override if the user did NOT explicitly set the per-component var.
@@ -68,19 +123,34 @@ ggml_backend_t init_backend(const char * component) {
     }
 #endif
 
+    std::string mode = lower_ascii(requested);
+
     ggml_backend_load_all();
     ggml_backend_t backend = nullptr;
-    if (std::strcmp(requested, "gpu") == 0) {
+    if (mode == "gpu") {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
         if (!backend) {
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
         }
         if (!backend) {
             fprintf(stderr, "[fatal] %s requested GPU backend, but ggml did not initialize one\n", component);
+            print_available_devices();
             return nullptr;
         }
-    } else if (std::strcmp(requested, "auto") == 0) {
+    } else if (mode == "auto") {
         backend = ggml_backend_init_best();
+    } else if (mode != "cpu") {
+        std::string device_name = cuda_device_alias(mode);
+        if (device_name.empty()) {
+            device_name = requested;
+        }
+        backend = ggml_backend_init_by_name(device_name.c_str(), nullptr);
+        if (!backend) {
+            fprintf(stderr, "[fatal] %s requested backend '%s', but ggml did not initialize device '%s'\n",
+                    component, requested, device_name.c_str());
+            print_available_devices();
+            return nullptr;
+        }
     }
     if (!backend) {
         backend = ggml_backend_cpu_init();

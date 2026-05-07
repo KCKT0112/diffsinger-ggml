@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,38 @@ static inline void ds_setenv(const char * key, const char * val) {
 #else
     setenv(key, val, 1);
 #endif
+}
+
+using SteadyClock = std::chrono::steady_clock;
+
+static double elapsed_s(SteadyClock::time_point start) {
+    return std::chrono::duration<double>(SteadyClock::now() - start).count();
+}
+
+struct SegmentTiming {
+    bool pitch_run = false;
+    bool variance_run = false;
+    bool stitch_run = false;
+    bool write_run = false;
+    double pitch_s = 0.0;
+    double variance_s = 0.0;
+    double acoustic_s = 0.0;
+    double vocoder_s = 0.0;
+    double stitch_s = 0.0;
+    double write_s = 0.0;
+    double total_s = 0.0;
+};
+
+static void print_segment_timing(size_t index, size_t total, const SegmentTiming & t) {
+    fprintf(stderr, "[time] segment %zu/%zu total=%.3fs", index, total, t.total_s);
+    if (t.pitch_run) fprintf(stderr, " pitch=%.3fs", t.pitch_s);
+    else             fprintf(stderr, " pitch=skip");
+    if (t.variance_run) fprintf(stderr, " variance=%.3fs", t.variance_s);
+    else                fprintf(stderr, " variance=skip");
+    fprintf(stderr, " acoustic=%.3fs vocoder=%.3fs", t.acoustic_s, t.vocoder_s);
+    if (t.stitch_run) fprintf(stderr, " stitch=%.3fs", t.stitch_s);
+    if (t.write_run)  fprintf(stderr, " write=%.3fs", t.write_s);
+    fprintf(stderr, "\n");
 }
 
 struct Segment {
@@ -49,8 +82,11 @@ static void usage() {
         "                           [--spk-id N | --spk-name NAME --spk-map MAP]\n"
         "                           [--seed N] [--steps N] [--algorithm euler|midpoint|rk4]\n"
         "                           [--precision f32|f16] [--mel-min X] [--mel-max X]\n"
-        "                           [--noise-scale X] [--backend cpu|gpu|auto]\n"
-        "                           [--pitch-backend cpu|gpu]\n"
+        "                           [--noise-scale X] [--backend cpu|gpu|auto|cuda[:N]]\n"
+        "                           [--variance-backend cpu|gpu|auto|cuda[:N]]\n"
+        "                           [--acoustic-backend cpu|gpu|auto|cuda[:N]]\n"
+        "                           [--vocoder-backend cpu|gpu|auto|cuda[:N]]\n"
+        "                           [--pitch-backend cpu|gpu|auto|cuda[:N]]\n"
         "                           [--predict-all-variances]\n"
         "\n"
         "Legacy TSV mode:\n"
@@ -209,7 +245,8 @@ static bool run_segment(const ds::Model & acoustic,
                         float mel_min,
                         bool has_mel_max,
                         float mel_max,
-                        float noise_scale) {
+                        float noise_scale,
+                        SegmentTiming * timing = nullptr) {
     ds::InferenceInputs ac_in;
     if (!read_all<int32_t>(s.tokens, ac_in.tokens)) return false;
     if (!read_all<int32_t>(s.mel2ph, ac_in.mel2ph)) return false;
@@ -247,7 +284,11 @@ static bool run_segment(const ds::Model & acoustic,
         ac_in.algorithm_override = alg;
 
     ds::InferenceOutputs mel;
-    if (!ds::run_inference(acoustic, ac_in, mel)) return false;
+    {
+        auto t0 = SteadyClock::now();
+        if (!ds::run_inference(acoustic, ac_in, mel)) return false;
+        if (timing) timing->acoustic_s += elapsed_s(t0);
+    }
 
     nsv::InferenceInputs voc_in;
     voc_in.frames = frames;
@@ -260,8 +301,20 @@ static bool run_segment(const ds::Model & acoustic,
     }
     voc_in.f0 = std::move(ac_in.f0);
     nsv::InferenceOutputs wav;
-    if (!nsv::run_vocoder(vocoder, voc_in, wav)) return false;
-    return write_f32(s.wav_out, wav.wav);
+    {
+        auto t0 = SteadyClock::now();
+        if (!nsv::run_vocoder(vocoder, voc_in, wav)) return false;
+        if (timing) timing->vocoder_s += elapsed_s(t0);
+    }
+    {
+        auto t0 = SteadyClock::now();
+        if (!write_f32(s.wav_out, wav.wav)) return false;
+        if (timing) {
+            timing->write_s += elapsed_s(t0);
+            timing->write_run = true;
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +330,8 @@ static bool run_segment_mem(const ds::Model & acoustic,
                             bool has_mel_min, float mel_min,
                             bool has_mel_max, float mel_max,
                             float noise_scale,
-                            std::vector<float> & out_wav) {
+                            std::vector<float> & out_wav,
+                            SegmentTiming * timing = nullptr) {
     ds::InferenceInputs ac_in;
     ac_in.tokens = seg.tokens;
     ac_in.mel2ph = seg.mel2ph;
@@ -306,7 +360,11 @@ static bool run_segment_mem(const ds::Model & acoustic,
         ac_in.algorithm_override = alg;
 
     ds::InferenceOutputs mel;
-    if (!ds::run_inference(acoustic, ac_in, mel)) return false;
+    {
+        auto t0 = SteadyClock::now();
+        if (!ds::run_inference(acoustic, ac_in, mel)) return false;
+        if (timing) timing->acoustic_s += elapsed_s(t0);
+    }
 
     nsv::InferenceInputs voc_in;
     voc_in.frames = frames;
@@ -319,7 +377,11 @@ static bool run_segment_mem(const ds::Model & acoustic,
     }
     voc_in.f0 = std::move(ac_in.f0);
     nsv::InferenceOutputs wav;
-    if (!nsv::run_vocoder(vocoder, voc_in, wav)) return false;
+    {
+        auto t0 = SteadyClock::now();
+        if (!nsv::run_vocoder(vocoder, voc_in, wav)) return false;
+        if (timing) timing->vocoder_s += elapsed_s(t0);
+    }
     out_wav = std::move(wav.wav);
     return true;
 }
@@ -385,6 +447,22 @@ static bool ensure_variance_mem(const dsv::Model & model,
         else if (name == "energy") seg.energy = std::move(sample_out.values[i]);
     }
     return true;
+}
+
+static bool needs_variance_mem(const dsv::Model & model,
+                               const dsp::DSSegment & seg,
+                               bool predict_all) {
+    if (predict_all) return !model.cfg.variance_targets.empty();
+    for (const auto & target : model.cfg.variance_targets) {
+        const std::string & name = target.name;
+        if (name == "breathiness" && seg.breathiness.empty()) return true;
+        if (name == "voicing" && seg.voicing.empty()) return true;
+        if (name == "tension" && seg.tension.empty()) return true;
+        if (name == "energy" && seg.energy.empty()) return true;
+        if (name != "breathiness" && name != "voicing" &&
+            name != "tension" && name != "energy") return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +531,7 @@ static bool write_wav(const std::string & path, const std::vector<float> & data,
 }
 
 int main(int argc, char ** argv) {
+    const auto program_t0 = SteadyClock::now();
     std::string variance_path;
     std::string acoustic_path;
     std::string vocoder_path;
@@ -618,14 +697,22 @@ int main(int argc, char ** argv) {
         // Process all segments
         std::vector<float> final_wav;
         int current_length = 0;
+        double total_pitch_s = 0.0;
+        double total_variance_s = 0.0;
+        double total_acoustic_s = 0.0;
+        double total_vocoder_s = 0.0;
+        double total_stitch_s = 0.0;
 
         for (size_t i = 0; i < segments.size(); ++i) {
+            SegmentTiming timing;
+            const auto segment_t0 = SteadyClock::now();
             fprintf(stderr, "[pipeline] segment %zu/%zu (T=%d)\n",
                     i + 1, segments.size(), (int)segments[i].mel2ph.size());
 
             // Run pitch model if available and needed
             if (have_pitch_model && (auto_pitch || segments[i].f0_hz.empty()) &&
                 !segments[i].note_midi.empty()) {
+                const auto pitch_t0 = SteadyClock::now();
                 dsp_pitch::PitchInputs pin;
                 pin.phones = (int)segments[i].tokens.size();
                 pin.frames = (int)segments[i].mel2ph.size();
@@ -669,6 +756,8 @@ int main(int argc, char ** argv) {
 
                 dsp_pitch::PitchOutputs pout;
                 if (!dsp_pitch::run_pitch_inference(pitch_model, pin, pout)) return 1;
+                timing.pitch_s += elapsed_s(pitch_t0);
+                timing.pitch_run = true;
                 segments[i].f0_hz = std::move(pout.f0_hz);
                 segments[i].pitch_midi = std::move(pout.pitch_midi);
                 if (!pout.voicing.empty()) {
@@ -677,31 +766,61 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "[pipeline] pitch model predicted F0 for segment %zu\n", i + 1);
             }
 
-            if (!ensure_variance_mem(variance, segments[i], spk_id, seed, predict_all_variances))
-                return 1;
+            {
+                const bool needs_variance = needs_variance_mem(variance, segments[i],
+                                                               predict_all_variances);
+                const auto variance_t0 = SteadyClock::now();
+                if (!ensure_variance_mem(variance, segments[i], spk_id, seed, predict_all_variances))
+                    return 1;
+                if (needs_variance) {
+                    timing.variance_s += elapsed_s(variance_t0);
+                    timing.variance_run = true;
+                }
+            }
 
             std::vector<float> seg_wav;
             if (!run_segment_mem(acoustic, vocoder, segments[i], spk_id, seed, steps,
-                                 has_mel_min, mel_min, has_mel_max, mel_max, noise_scale, seg_wav))
+                                 has_mel_min, mel_min, has_mel_max, mel_max, noise_scale, seg_wav,
+                                 &timing))
                 return 1;
 
             // Stitch with offset-based crossfade
-            int offset_samples = (int)std::lround(segments[i].offset * 44100.0);
-            int silent_length = offset_samples - current_length;
-            if (silent_length >= 0) {
-                if (silent_length > 0) {
-                    final_wav.resize(final_wav.size() + silent_length, 0.0f);
+            {
+                const auto stitch_t0 = SteadyClock::now();
+                int offset_samples = (int)std::lround(segments[i].offset * 44100.0);
+                int silent_length = offset_samples - current_length;
+                if (silent_length >= 0) {
+                    if (silent_length > 0) {
+                        final_wav.resize(final_wav.size() + silent_length, 0.0f);
+                    }
+                    final_wav.insert(final_wav.end(), seg_wav.begin(), seg_wav.end());
+                } else {
+                    cross_fade(final_wav, seg_wav, current_length + silent_length);
                 }
-                final_wav.insert(final_wav.end(), seg_wav.begin(), seg_wav.end());
-            } else {
-                cross_fade(final_wav, seg_wav, current_length + silent_length);
+                current_length = current_length + silent_length + (int)seg_wav.size();
+                timing.stitch_s += elapsed_s(stitch_t0);
+                timing.stitch_run = true;
             }
-            current_length = current_length + silent_length + (int)seg_wav.size();
+
+            timing.total_s = elapsed_s(segment_t0);
+            total_pitch_s += timing.pitch_s;
+            total_variance_s += timing.variance_s;
+            total_acoustic_s += timing.acoustic_s;
+            total_vocoder_s += timing.vocoder_s;
+            total_stitch_s += timing.stitch_s;
+            print_segment_timing(i + 1, segments.size(), timing);
         }
 
+        const auto write_t0 = SteadyClock::now();
         if (!write_wav(out_path, final_wav, 44100)) return 1;
+        const double write_s = elapsed_s(write_t0);
+        const double total_s = elapsed_s(program_t0);
         fprintf(stderr, "[ok] wrote %s (%d segments, %.1fs audio)\n",
                 out_path.c_str(), (int)segments.size(), (float)final_wav.size() / 44100.0f);
+        fprintf(stderr,
+                "[time] totals load+pipeline+write=%.3fs pitch=%.3fs variance=%.3fs acoustic=%.3fs vocoder=%.3fs stitch=%.3fs write=%.3fs\n",
+                total_s, total_pitch_s, total_variance_s, total_acoustic_s,
+                total_vocoder_s, total_stitch_s, write_s);
         return 0;
     }
 
@@ -723,12 +842,45 @@ int main(int argc, char ** argv) {
     nsv::Model vocoder;
     if (!vocoder.load(vocoder_path)) return 1;
 
+    double total_variance_s = 0.0;
+    double total_acoustic_s = 0.0;
+    double total_vocoder_s = 0.0;
+    double total_write_s = 0.0;
     for (size_t i = 0; i < segments.size(); ++i) {
+        SegmentTiming timing;
+        const auto segment_t0 = SteadyClock::now();
         fprintf(stderr, "[pipeline] segment %zu/%zu\n", i + 1, segments.size());
-        if (!ensure_variance_curves(variance, segments[i], spk_id, seed, predict_all_variances)) return 1;
+        {
+            bool needs_variance = predict_all_variances;
+            if (!needs_variance) {
+                for (const auto & target : variance.cfg.variance_targets) {
+                    if (!exists_file(segments[i].variance_dir + "/" + target.name + ".bin")) {
+                        needs_variance = true;
+                        break;
+                    }
+                }
+            }
+            const auto variance_t0 = SteadyClock::now();
+            if (!ensure_variance_curves(variance, segments[i], spk_id, seed, predict_all_variances)) return 1;
+            if (needs_variance) {
+                timing.variance_s += elapsed_s(variance_t0);
+                timing.variance_run = true;
+            }
+        }
         if (!run_segment(acoustic, vocoder, segments[i], spk_id, seed, steps,
-                         has_mel_min, mel_min, has_mel_max, mel_max, noise_scale)) return 1;
+                         has_mel_min, mel_min, has_mel_max, mel_max, noise_scale,
+                         &timing)) return 1;
         fprintf(stderr, "[pipeline] wrote %s\n", segments[i].wav_out.c_str());
+        timing.total_s = elapsed_s(segment_t0);
+        total_variance_s += timing.variance_s;
+        total_acoustic_s += timing.acoustic_s;
+        total_vocoder_s += timing.vocoder_s;
+        total_write_s += timing.write_s;
+        print_segment_timing(i + 1, segments.size(), timing);
     }
+    fprintf(stderr,
+            "[time] totals load+pipeline=%.3fs variance=%.3fs acoustic=%.3fs vocoder=%.3fs write=%.3fs\n",
+            elapsed_s(program_t0), total_variance_s, total_acoustic_s,
+            total_vocoder_s, total_write_s);
     return 0;
 }

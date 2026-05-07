@@ -65,8 +65,8 @@ static ggml_tensor * conv1d_k1_as_linear(ggml_context * ctx,
 
 static ggml_tensor * atanglu(ggml_context * ctx, ggml_tensor * x) {
     const int64_t c = x->ne[0] / 2;
-    ggml_tensor * out = ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], 0);
-    ggml_tensor * gate = ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], c * x->nb[0]);
+    ggml_tensor * out = ggml_cont(ctx, ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], 0));
+    ggml_tensor * gate = ggml_cont(ctx, ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], c * x->nb[0]));
     // out * atan(gate) using branchless polynomial approximation that runs
     // on Metal/CPU/CUDA via stock ggml ops.
     //   sx = sign(gate)
