@@ -1177,7 +1177,11 @@ bool sample_variances(const Model & m, const VarianceSampleInputs & in, Variance
             if (!fetch_tensor_f32(m, prefix + ".weight", emb_w, true)) return false;
             if (!fetch_tensor_f32(m, prefix + ".bias", emb_b, true)) return false;
             if (emb_w.data.empty() && emb_b.data.empty()) continue;
-            std::vector<float> emb = linear_row_major(in.existing_values[(size_t)f], T, 1, emb_w, emb_b);
+            // Apply variance_scaling_factor before embedding (matches PyTorch variance_retake_scaling)
+            std::vector<float> scaled_values = in.existing_values[(size_t)f];
+            float scale = c.variance_targets[(size_t)f].variance_scaling;
+            for (float & sv : scaled_values) sv *= scale;
+            std::vector<float> emb = linear_row_major(scaled_values, T, 1, emb_w, emb_b);
             for (int t = 0; t < T; ++t) {
                 if (in.retake_masks[(size_t)f][(size_t)t] != 0) continue;
                 for (uint32_t h = 0; h < c.hidden_size; ++h) {

@@ -19,6 +19,7 @@ struct VarianceTarget {
     float norm_max = 0.0f;
     float clip_min = 0.0f;
     float clip_max = 0.0f;
+    float variance_scaling = 1.0f;  // scaling factor for retake conditioning (1/96 for dB, 0.1 for tension)
 };
 
 struct FlowConfig {

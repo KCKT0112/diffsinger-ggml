@@ -67,6 +67,13 @@ static bool load_variance_targets(gguf_context * gc, Config & cfg) {
         t.clip_min = get_f32(gc, key, t.norm_min);
         snprintf(key, sizeof key, "diffsinger-variance.variance.target.%u.clip_max", i);
         t.clip_max = get_f32(gc, key, t.norm_max);
+        // variance_scaling_factor for retake conditioning (matches PyTorch variance_retake_scaling)
+        if (cfg.use_variance_scaling) {
+            if (t.name == "tension") t.variance_scaling = 0.1f;
+            else t.variance_scaling = 1.0f / 96.0f;  // energy, breathiness, voicing
+        } else {
+            t.variance_scaling = 1.0f;
+        }
         cfg.variance_targets.push_back(t);
     }
     return true;
