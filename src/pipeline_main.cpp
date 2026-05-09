@@ -77,16 +77,17 @@ static void usage() {
         "                           --vocoder-model <vocoder.gguf>\n"
         "                           --ds <file.ds> --phonemes <phonemes.json>\n"
         "                           --out <output.wav>\n"
-        "                           [--pitch-model <pitch.gguf>] [--auto-pitch]\n"
+        "                           [--pitch-model <pitch.gguf>] [--auto-duration] [--auto-pitch]\n"
         "                           [--pitch-phonemes <pitch_phonemes.json>]\n"
         "                           [--spk-id N | --spk-name NAME --spk-map MAP]\n"
         "                           [--seed N] [--steps N] [--algorithm euler|midpoint|rk4]\n"
         "                           [--precision f32|f16] [--mel-min X] [--mel-max X]\n"
-        "                           [--noise-scale X] [--backend cpu|gpu|auto|cuda[:N]]\n"
-        "                           [--variance-backend cpu|gpu|auto|cuda[:N]]\n"
-        "                           [--acoustic-backend cpu|gpu|auto|cuda[:N]]\n"
-        "                           [--vocoder-backend cpu|gpu|auto|cuda[:N]]\n"
-        "                           [--pitch-backend cpu|gpu|auto|cuda[:N]]\n"
+        "                           [--noise-scale X] [--backend cpu|gpu|auto|cuda[:N]|vulkan[:N]]\n"
+        "                           [--threads N|auto]\n"
+        "                           [--variance-backend cpu|gpu|auto|cuda[:N]|vulkan[:N]]\n"
+        "                           [--acoustic-backend cpu|gpu|auto|cuda[:N]|vulkan[:N]]\n"
+        "                           [--vocoder-backend cpu|gpu|auto|cuda[:N]|vulkan[:N]]\n"
+        "                           [--pitch-backend cpu|gpu|auto|cuda[:N]|vulkan[:N]]\n"
         "                           [--predict-all-variances]\n"
         "\n"
         "Legacy TSV mode:\n"
@@ -221,6 +222,18 @@ static bool ensure_variance_curves(const dsv::Model & model,
     sample_in.seed = seed;
     sample_in.condition = std::move(vc_out.condition);
     dsv::VarianceSampleOutputs sample_out;
+    sample_in.existing_values.assign(model.cfg.variance_targets.size(), std::vector<float>((size_t)fs2_in.frames, 0.0f));
+    sample_in.retake_masks.assign(model.cfg.variance_targets.size(), std::vector<int32_t>((size_t)fs2_in.frames, 1));
+    for (size_t i = 0; i < model.cfg.variance_targets.size(); ++i) {
+        if (i >= missing.size() || missing[i]) continue;
+        const std::string path = s.variance_dir + "/" + model.cfg.variance_targets[i].name + ".bin";
+        if (!read_all<float>(path, sample_in.existing_values[i])) return false;
+        if ((int)sample_in.existing_values[i].size() != fs2_in.frames) {
+            fprintf(stderr, "[err] variance curve size mismatch: %s\n", path.c_str());
+            return false;
+        }
+        std::fill(sample_in.retake_masks[i].begin(), sample_in.retake_masks[i].end(), 0);
+    }
     if (!dsv::sample_variances(model, sample_in, sample_out)) return false;
     return write_missing_variances(sample_out, missing, s.variance_dir);
 }
@@ -434,6 +447,20 @@ static bool ensure_variance_mem(const dsv::Model & model,
     sample_in.frames = T;
     sample_in.seed = seed;
     sample_in.condition = std::move(vc_out.condition);
+    sample_in.existing_values.assign(model.cfg.variance_targets.size(), std::vector<float>((size_t)T, 0.0f));
+    sample_in.retake_masks.assign(model.cfg.variance_targets.size(), std::vector<int32_t>((size_t)T, 1));
+    for (size_t i = 0; i < model.cfg.variance_targets.size(); ++i) {
+        if (i >= missing.size() || missing[i]) continue;
+        const std::string & name = model.cfg.variance_targets[i].name;
+        const std::vector<float> * src = nullptr;
+        if (name == "breathiness") src = &seg.breathiness;
+        else if (name == "voicing") src = &seg.voicing;
+        else if (name == "tension") src = &seg.tension;
+        else if (name == "energy") src = &seg.energy;
+        if (!src || (int)src->size() != T) continue;
+        sample_in.existing_values[i] = *src;
+        std::fill(sample_in.retake_masks[i].begin(), sample_in.retake_masks[i].end(), 0);
+    }
     dsv::VarianceSampleOutputs sample_out;
     if (!dsv::sample_variances(model, sample_in, sample_out)) return false;
 
@@ -463,6 +490,55 @@ static bool needs_variance_mem(const dsv::Model & model,
             name != "tension" && name != "energy") return true;
     }
     return false;
+}
+
+static int target_segment_frames(const dsp::DSSegment & seg) {
+    if (!seg.base_pitch.empty()) return (int)seg.base_pitch.size();
+    if (!seg.f0_hz.empty()) return (int)seg.f0_hz.size();
+    if (!seg.pitch_midi.empty()) return (int)seg.pitch_midi.size();
+    int total = 0;
+    for (float v : seg.word_dur) total += (int)std::lround(v);
+    return total;
+}
+
+static std::vector<float> mel2ph_to_ph_dur(const std::vector<int32_t> & mel2ph, int phones) {
+    std::vector<float> ph_dur((size_t)phones, 0.0f);
+    for (int32_t p : mel2ph) {
+        if (p > 0 && p <= phones) ph_dur[(size_t)(p - 1)] += 1.0f;
+    }
+    return ph_dur;
+}
+
+static void align_duration_segment(dsp::DSSegment & seg) {
+    const int target = target_segment_frames(seg);
+    if (seg.mel2ph.empty() || target <= 0) return;
+    if ((int)seg.mel2ph.size() < target) {
+        const int32_t pad = seg.mel2ph.back();
+        seg.mel2ph.resize((size_t)target, pad);
+    } else if ((int)seg.mel2ph.size() > target) {
+        seg.mel2ph.resize((size_t)target);
+    }
+    seg.ph_dur = mel2ph_to_ph_dur(seg.mel2ph, (int)seg.tokens.size());
+}
+
+static bool ensure_duration_mem(const dsv::Model & model,
+                                dsp::DSSegment & seg,
+                                int spk_id) {
+    if (!seg.ph_dur.empty() && !seg.mel2ph.empty()) return true;
+    dsv::DurationInputs in;
+    in.phones = (int)seg.tokens.size();
+    in.spk_id = spk_id;
+    in.tokens = seg.tokens;
+    in.ph2word = seg.ph2word;
+    in.word_dur = seg.word_dur;
+    in.midi = seg.midi;
+    in.languages = seg.languages;
+    dsv::DurationOutputs out;
+    if (!dsv::predict_durations(model, in, out)) return false;
+    seg.ph_dur = std::move(out.ph_dur);
+    seg.mel2ph = std::move(out.mel2ph);
+    align_duration_segment(seg);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +629,7 @@ int main(int argc, char ** argv) {
     float mel_max = 0.0f;
     float noise_scale = 1.0f;
     bool predict_all_variances = false;
+    bool auto_duration = false;
     bool auto_pitch = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -569,6 +646,7 @@ int main(int argc, char ** argv) {
         else if (a == "--vocoder-model") vocoder_path = next();
         else if (a == "--pitch-model") pitch_model_path = next();
         else if (a == "--pitch-phonemes") pitch_phonemes_path = next();
+        else if (a == "--auto-duration") auto_duration = true;
         else if (a == "--auto-pitch") auto_pitch = true;
         else if (a == "--manifest") manifest_path = next();
         else if (a == "--ds") ds_path = next();
@@ -587,6 +665,7 @@ int main(int argc, char ** argv) {
         else if (a == "--mel-max") { mel_max = (float)std::atof(next().c_str()); has_mel_max = true; }
         else if (a == "--noise-scale") noise_scale = (float)std::atof(next().c_str());
         else if (a == "--backend") dsrt::set_backend_mode(next().c_str());
+        else if (a == "--threads") dsrt::set_runtime_threads(next().c_str());
         else if (a == "--variance-backend") {
             std::string mode = next();
             ds_setenv("DSGGML_BACKEND_VARIANCE", mode.c_str());
@@ -707,7 +786,27 @@ int main(int argc, char ** argv) {
             SegmentTiming timing;
             const auto segment_t0 = SteadyClock::now();
             fprintf(stderr, "[pipeline] segment %zu/%zu (T=%d)\n",
-                    i + 1, segments.size(), (int)segments[i].mel2ph.size());
+                    i + 1, segments.size(), target_segment_frames(segments[i]));
+
+            if (segments[i].ph_dur.empty() || segments[i].mel2ph.empty()) {
+                if (!auto_duration) {
+                    fprintf(stderr,
+                            "[err] segment %zu is missing phone durations/alignment; rerun with --auto-duration\n",
+                            i + 1);
+                    return 1;
+                }
+                if (!variance.cfg.predict_dur) {
+                    fprintf(stderr,
+                            "[err] variance model does not export duration prediction, but segment %zu needs it\n",
+                            i + 1);
+                    return 1;
+                }
+                const auto dur_t0 = SteadyClock::now();
+                if (!ensure_duration_mem(variance, segments[i], spk_id)) return 1;
+                timing.variance_s += elapsed_s(dur_t0);
+                timing.variance_run = true;
+                fprintf(stderr, "[pipeline] duration model predicted mel2ph for segment %zu\n", i + 1);
+            }
 
             // Run pitch model if available and needed
             if (have_pitch_model && (auto_pitch || segments[i].f0_hz.empty()) &&
@@ -835,12 +934,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    auto user_precision = dsrt::get_precision();
+    dsrt::set_precision(dsrt::Precision::F32);
     dsv::Model variance;
     if (!variance.load(variance_path)) return 1;
     ds::Model acoustic;
     if (!acoustic.load(acoustic_path)) return 1;
+    dsrt::set_precision(user_precision);
     nsv::Model vocoder;
     if (!vocoder.load(vocoder_path)) return 1;
+    dsrt::set_precision(dsrt::Precision::F32);
 
     double total_variance_s = 0.0;
     double total_acoustic_s = 0.0;

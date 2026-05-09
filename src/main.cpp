@@ -24,7 +24,8 @@ static void usage() {
         "  [--algorithm A]  euler|midpoint|rk4 (default: from gguf)\n"
         "  [--seed N]       PRNG seed (default 1234)\n"
         "  [--spk-id N]     speaker id for multi-speaker acoustic checkpoints\n"
-        "  [--backend cpu|gpu|auto|cuda[:N]]\n"
+        "  [--backend cpu|gpu|auto|cuda[:N]|vulkan[:N]]\n"
+        "  [--threads N|auto] CPU backend thread count (default: auto)\n"
         "  [--noise-bin P]  raw float32 [T, mel_bins] fixed noise for x_t init\n"
         "                   (overrides --seed)\n"
         "  [--dump-cond]    output encoder cond [T,H] instead of mel\n");
@@ -66,6 +67,7 @@ int main(int argc, char ** argv) {
         else if (a == "--seed")             seed = (uint32_t)std::atoll(next().c_str());
         else if (a == "--spk-id")           spk_id = std::atoi(next().c_str());
         else if (a == "--backend")          dsrt::set_backend_mode(next().c_str());
+        else if (a == "--threads")          dsrt::set_runtime_threads(next().c_str());
         else if (a == "--precision") {
             std::string m = next();
             if (m == "f16" || m == "fp16") dsrt::set_precision(dsrt::Precision::F16);

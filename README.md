@@ -1,7 +1,7 @@
 # DiffSinger ggml Runtime
 
 Standalone C++17/ggml inference for DiffSinger singing voice synthesis.
-Supports variance, pitch, acoustic, and vocoder models with CPU, Metal, and CUDA backends.
+Supports variance, pitch, acoustic, and vocoder models with CPU, Metal, CUDA, and Vulkan backends.
 
 ## Assets
 
@@ -64,6 +64,29 @@ cmake -S . -B build/cuda-release -DCMAKE_BUILD_TYPE=Release -DDSGGML_CUDA=ON
 cmake --build build/cuda-release -j
 ```
 
+Vulkan builds use an existing Vulkan SDK with `glslc` when CMake can find one.
+On Windows, the Vulkan presets download and install a local SDK into the build
+tree if no SDK is found:
+
+```bash
+cmake --preset vulkan-release
+cmake --build --preset vulkan-release
+```
+
+The same options can be used without presets:
+
+```bash
+cmake -S . -B build/vulkan-release -DCMAKE_BUILD_TYPE=Release -DDSGGML_VULKAN=ON -DDSGGML_FETCH_VULKAN=ON
+cmake --build build/vulkan-release -j
+```
+
+The fetched SDK defaults to LunarG SDK `1.4.341.1` and installs under
+`build/vulkan-release/_deps/vulkan-sdk`. Override these with
+`-DDSGGML_VULKAN_SDK_VERSION=<version>` and
+`-DDSGGML_VULKAN_SDK_ROOT=<path>`. To require a preinstalled SDK instead, pass
+`-DDSGGML_FETCH_VULKAN=OFF`; ggml then relies on CMake's
+`find_package(Vulkan COMPONENTS glslc REQUIRED)`.
+
 ## Full Pipeline (`diffsinger_pipeline`)
 
 The fused C++ pipeline loads all models once and processes `.ds` files end-to-end:
@@ -115,11 +138,12 @@ instead of using the `.ds` file's `f0_seq`:
 | `--spk-map PATH` | Speaker name→id JSON (required with `--spk-name`) |
 | `--predict-all-variances` | Overwrite existing variance curves from .ds |
 | `--precision f32\|f16` | Weight precision (default: f32, see below) |
-| `--backend cpu\|gpu\|auto\|cuda[:N]` | Global compute backend |
-| `--variance-backend cpu\|gpu\|auto\|cuda[:N]` | Per-component backend override |
-| `--acoustic-backend cpu\|gpu\|auto\|cuda[:N]` | |
-| `--vocoder-backend cpu\|gpu\|auto\|cuda[:N]` | |
-| `--pitch-backend cpu\|gpu\|auto\|cuda[:N]` | |
+| `--backend cpu\|gpu\|auto\|cuda[:N]\|vulkan[:N]` | Global compute backend |
+| `--threads N\|auto` | CPU backend thread count (default: auto-selected) |
+| `--variance-backend cpu\|gpu\|auto\|cuda[:N]\|vulkan[:N]` | Per-component backend override |
+| `--acoustic-backend cpu\|gpu\|auto\|cuda[:N]\|vulkan[:N]` | |
+| `--vocoder-backend cpu\|gpu\|auto\|cuda[:N]\|vulkan[:N]` | |
+| `--pitch-backend cpu\|gpu\|auto\|cuda[:N]\|vulkan[:N]` | |
 
 ### Precision (`--precision`)
 
@@ -135,13 +159,21 @@ already the smallest and fastest component. The GGUF files should remain F32 for
 
 ### Backend Notes
 
-- **CPU** (default): stable, fast on Apple Silicon (~1.8s per segment with midpoint-5)
-- **GPU** (Metal/CUDA): all ops use ggml's registered GPU backend when available.
+- **CPU** (default): stable. Thread count is auto-selected from the runtime CPU
+  (prefers physical cores when available, capped at 16 in auto mode).
+  Override with `--threads N`, `--threads auto`, `DSGGML_THREADS=N`, or
+  `DSGGML_THREADS=auto`.
+- **GPU** (Metal/CUDA/Vulkan): all ops use ggml's registered GPU backend when available.
 - **CUDA**: build with `-DDSGGML_CUDA=ON` or the `cuda-release` preset, then run with
   `--backend cuda` for device 0 or `--backend cuda:N` for device N. `--backend gpu`
   also selects the first registered discrete GPU. CUDA builds apply local ggml
   patches for long-output `IM2COL` and ConvTranspose1D, so the NSF-HiFiGAN
   vocoder runs on CUDA too.
+- **Vulkan**: build with `-DDSGGML_VULKAN=ON` or the `vulkan-release` preset.
+  On Windows, CMake downloads a local LunarG SDK when none is already
+  discoverable. Run with
+  `--backend vulkan` for device 0 or `--backend vulkan:N` for device N.
+  `--backend gpu` also selects the first registered discrete GPU.
 - **Metal**: all ops are Metal-native, but ~38s cold JIT compilation cost.
   Only worthwhile for long-running servers that amortize the JIT.
   Recommended: keep vocoder on CPU regardless.
@@ -204,7 +236,7 @@ Run vocoder from mel:
   --out out.wav
 ```
 
-## Performance (Apple Silicon M4, CPU, F32, 4 threads)
+## Performance (Apple Silicon M4, CPU, F32)
 
 | Component | T=333 frames | Notes |
 |-----------|-------------|-------|
@@ -214,7 +246,29 @@ Run vocoder from mel:
 | Vocoder | ~0.3s | NSF-HiFiGAN |
 | **Total per segment** | **~5.4s** | For ~3.9s of audio (T=333) |
 
-Set thread count: `DSGGML_THREADS=N` (default: 4).
+CPU thread count is auto-selected by default. Override examples:
+`DSGGML_THREADS=16`, `--threads 16`, or `--threads auto`.
+
+For CPU benchmarking, try `8`, `12`, `16`, and `24`; optimal ggml/OpenMP
+thread count can vary by CPU, model stage, and thermal limits.
+
+### Backend Benchmark Script
+
+Run CUDA, Vulkan, and CPU sequentially with the same pipeline inputs:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\benchmark_backends.ps1 `
+  -Config scripts\benchmark_presets.example.json `
+  -ConfigPreset zhibin-06 `
+  -Repeats 3 -Warmups 1
+```
+
+The CPU pass uses `--threads auto`. Copy `scripts\benchmark_presets.example.json`
+for local songs/models, then add `-Build` to build missing presets first, use
+`-Backends cuda,vulkan,cpu` to change the order, and inspect
+`build\benchmarks\<preset>\benchmark_summary.csv` plus per-run logs. Presets can
+set `componentBackends`, for example `["vocoder", "pitch"]`, to emit matching
+`--vocoder-backend` and `--pitch-backend` overrides for each measured backend.
 
 ## Scripts
 
@@ -228,6 +282,8 @@ Set thread count: `DSGGML_THREADS=N` (default: 4).
 | `dump_pt_reference.py` | Diagnostic: dump PyTorch acoustic reference tensors |
 | `dump_pt_variance.py` | Diagnostic: dump PyTorch variance reference + noise |
 | `dump_pt_vocoder.py` | Diagnostic: compare PT vs ggml vocoder output |
+| `benchmark_backends.ps1` | Sequential CUDA/Vulkan/CPU pipeline benchmark |
+| `benchmark_presets.example.json` | Example benchmark preset config |
 
 ## Diagnostic Environment Variables
 
@@ -244,5 +300,5 @@ For debugging/validation against PyTorch:
 | `DSDIAG_VAR_NOISE` | variance | Load fixed variance noise |
 | `DSDIAG_VAR_RAW_OUT` | variance | Dump raw post-flow output |
 | `DSDIAG_PITCH_NOISE` | pitch | Load fixed pitch noise |
-| `DSGGML_THREADS` | all | Override CPU thread count |
-| `DSGGML_BACKEND_*` | all | Per-component backend (VARIANCE/ACOUSTIC/VOCODER/PITCH), supports `cpu`, `gpu`, `auto`, and `cuda[:N]` |
+| `DSGGML_THREADS` | all | Override CPU thread count; positive integer, `0`, or `auto` |
+| `DSGGML_BACKEND_*` | all | Per-component backend (VARIANCE/ACOUSTIC/VOCODER/PITCH), supports `cpu`, `gpu`, `auto`, `cuda[:N]`, and `vulkan[:N]` |

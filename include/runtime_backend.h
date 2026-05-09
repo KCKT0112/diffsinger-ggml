@@ -13,6 +13,7 @@
 namespace dsrt {
 
 void set_backend_mode(const char * mode);
+void set_runtime_threads(const char * value);
 ggml_backend_t init_backend(const char * component);
 
 // Precision mode for weight loading (F32 = keep original, F16 = convert at load time)

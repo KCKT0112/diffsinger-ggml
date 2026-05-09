@@ -99,6 +99,7 @@ def short_name(name: str) -> str:
         ("melody_encoder.encoder.layers.", "mel.enc."),
         ("melody_encoder.note_midi_embed.", "mel.midi_embed."),
         ("melody_encoder.note_dur_embed.", "mel.dur_embed."),
+        ("melody_encoder.note_glide_embed.", "mel.note_glide_embed."),
         ("melody_encoder.out_proj.", "mel.out_proj."),
         ("pitch_predictor.velocity_fn.", "pitch.vf."),
         ("variance_predictor.velocity_fn.", "var.vf."),
@@ -133,6 +134,9 @@ def add_scalar_metadata(gw: gguf.GGUFWriter, cfg: dict[str, Any], sd: dict[str, 
     gw.add_bool(f"{ARCH}.use_spk_id", bool(cfg.get("use_spk_id", False)))
     gw.add_bool(f"{ARCH}.use_variance_scaling", bool(cfg.get("use_variance_scaling", False)))
     gw.add_bool(f"{ARCH}.use_melody_encoder", bool(cfg.get("use_melody_encoder", False)))
+    gw.add_bool(f"{ARCH}.use_glide_embed", bool(cfg.get("use_glide_embed", False)))
+    gw.add_float32(f"{ARCH}.glide_embed_scale", float(cfg.get("glide_embed_scale", 1.0)))
+    gw.add_float32(f"{ARCH}.midi_smooth_width", float(cfg.get("midi_smooth_width", 0.12)))
     gw.add_string(f"{ARCH}.diffusion_type", str(cfg.get("diffusion_type", "reflow")))
     gw.add_uint32(f"{ARCH}.time_scale_factor", int(cfg.get("time_scale_factor", 1000)))
     gw.add_string(f"{ARCH}.sampling_algorithm", str(cfg.get("sampling_algorithm", "euler")))
@@ -140,6 +144,8 @@ def add_scalar_metadata(gw: gguf.GGUFWriter, cfg: dict[str, Any], sd: dict[str, 
     gw.add_uint32(f"{ARCH}.vocab_size", int(sd["fs2.txt_embed.weight"].shape[0]))
     gw.add_uint32(f"{ARCH}.num_spk", int(sd["spk_embed.weight"].shape[0]))
     gw.add_uint32(f"{ARCH}.num_lang", int(sd.get("fs2.lang_embed.weight", np.zeros((0,))).shape[0]))
+    gw.add_uint32(f"{ARCH}.audio_sample_rate", int(cfg.get("audio_sample_rate", 44100)))
+    gw.add_uint32(f"{ARCH}.hop_size", int(cfg.get("hop_size", 512)))
 
     # Melody encoder params
     if cfg.get("use_melody_encoder", False):

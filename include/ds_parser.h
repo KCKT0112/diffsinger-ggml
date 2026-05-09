@@ -16,6 +16,7 @@ struct DSSegment {
     std::vector<float>   word_dur;          // [W], frame counts per word
     std::vector<float>   ph_dur;            // [L], frame counts per phone
     std::vector<int32_t> mel2ph;            // [T], 1-based phone index
+    std::vector<int32_t> midi;              // [L], phoneme-level rounded MIDI for duration predictor
     std::vector<float>   f0_hz;             // [T]
     std::vector<float>   pitch_midi;        // [T]
     std::vector<int32_t> languages;         // [L], all zeros if no lang_id
@@ -23,6 +24,7 @@ struct DSSegment {
     // Note-level info (for pitch model)
     std::vector<float>   note_midi;         // [N], MIDI pitch (-1 = rest/pad)
     std::vector<int32_t> note_rest;         // [N], 1 if rest
+    std::vector<int32_t> note_glide;        // [N], glide id (0 = none)
     std::vector<int32_t> note_dur_frames;   // [N], duration in frames
     std::vector<int32_t> mel2note;          // [T], 1-based note index
     std::vector<float>   base_pitch;        // [T], MIDI semitones from note expansion

@@ -1,11 +1,28 @@
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#endif
+
 #include "runtime_backend.h"
 
+#include <cerrno>
 #include <cctype>
+#include <climits>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace dsrt {
 
@@ -14,21 +31,20 @@ static Precision g_precision = Precision::F32;
 void set_precision(Precision p) { g_precision = p; }
 Precision get_precision() { return g_precision; }
 
-void set_backend_mode(const char * mode) {
+static void set_env_override(const char * key, const char * value) {
 #if defined(_WIN32)
-    _putenv_s("DSGGML_BACKEND", mode ? mode : "");
+    _putenv_s(key, value ? value : "");
 #else
-    setenv("DSGGML_BACKEND", mode ? mode : "", 1);
+    setenv(key, value ? value : "", 1);
 #endif
 }
 
-static int runtime_threads() {
-    int nth = 4;
-    if (const char * env = std::getenv("DSGGML_THREADS")) {
-        int v = std::atoi(env);
-        if (v > 0) nth = v;
-    }
-    return nth;
+void set_backend_mode(const char * mode) {
+    set_env_override("DSGGML_BACKEND", mode);
+}
+
+void set_runtime_threads(const char * value) {
+    set_env_override("DSGGML_THREADS", value);
 }
 
 static std::string lower_ascii(const char * value) {
@@ -47,6 +63,169 @@ static bool all_digits(const std::string & value) {
     return true;
 }
 
+struct AutoThreadInfo {
+    int threads = 4;
+    int physical = 0;
+    int logical = 0;
+};
+
+struct ThreadSelection {
+    int threads = 4;
+    bool automatic = true;
+    int physical = 0;
+    int logical = 0;
+};
+
+static int cap_auto_thread_count(unsigned int count) {
+    const unsigned int max_auto_threads = 16;
+    if (count == 0) return 4;
+    if (count > max_auto_threads) return (int)max_auto_threads;
+    return (int)count;
+}
+
+static int uint_to_int_saturated(unsigned int value) {
+    return value > (unsigned int)INT_MAX ? INT_MAX : (int)value;
+}
+
+#if defined(_WIN32)
+static int popcount_processor_mask(ULONG_PTR mask) {
+    int count = 0;
+    while (mask != 0) {
+        count += (int)(mask & 1u);
+        mask >>= 1;
+    }
+    return count;
+}
+
+static bool detect_windows_cpu_counts(int & physical, int & logical) {
+    DWORD length = 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length)) {
+        return false;
+    }
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || length == 0) {
+        return false;
+    }
+
+    std::vector<unsigned char> buffer(length);
+    if (!GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+            &length)) {
+        return false;
+    }
+
+    const char * ptr = reinterpret_cast<const char *>(buffer.data());
+    const char * end = ptr + length;
+    const size_t record_header_size =
+        sizeof(LOGICAL_PROCESSOR_RELATIONSHIP) + sizeof(DWORD);
+    const size_t processor_group_mask_offset =
+        offsetof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Processor) +
+        offsetof(PROCESSOR_RELATIONSHIP, GroupMask);
+    while (ptr < end) {
+        const size_t remaining = (size_t)(end - ptr);
+        if (remaining < record_header_size) {
+            return false;
+        }
+        const auto * info =
+            reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(ptr);
+        if (info->Size < record_header_size || info->Size > remaining) {
+            return false;
+        }
+        if (info->Relationship == RelationProcessorCore) {
+            ++physical;
+            const PROCESSOR_RELATIONSHIP & proc = info->Processor;
+            const size_t required_size =
+                processor_group_mask_offset + sizeof(GROUP_AFFINITY) * proc.GroupCount;
+            if (info->Size < required_size) {
+                return false;
+            }
+            for (WORD i = 0; i < proc.GroupCount; ++i) {
+                logical += popcount_processor_mask(proc.GroupMask[i].Mask);
+            }
+        }
+        ptr += info->Size;
+    }
+    return physical > 0 || logical > 0;
+}
+#endif
+
+static AutoThreadInfo detect_auto_threads() {
+    AutoThreadInfo info;
+#if defined(_WIN32)
+    if (detect_windows_cpu_counts(info.physical, info.logical)) {
+        const int preferred = info.physical > 0 ? info.physical : info.logical;
+        info.threads = cap_auto_thread_count((unsigned int)preferred);
+        return info;
+    }
+#endif
+    const unsigned int hc = std::thread::hardware_concurrency();
+    info.logical = uint_to_int_saturated(hc);
+    info.threads = cap_auto_thread_count(hc);
+    return info;
+}
+
+static const AutoThreadInfo & cached_auto_threads() {
+    static const AutoThreadInfo info = detect_auto_threads();
+    return info;
+}
+
+static ThreadSelection auto_thread_selection() {
+    const AutoThreadInfo & info = cached_auto_threads();
+    ThreadSelection selected;
+    selected.threads = info.threads;
+    selected.automatic = true;
+    selected.physical = info.physical;
+    selected.logical = info.logical;
+    return selected;
+}
+
+static bool is_decimal_digits(const char * value) {
+    if (!value || value[0] == '\0') return false;
+    for (const char * p = value; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    return true;
+}
+
+static void warn_invalid_threads_once(const char * value) {
+    static std::string last_warned;
+    std::string current = value ? value : "";
+    if (current == last_warned) return;
+    last_warned = current;
+    fprintf(stderr,
+            "[warn] invalid DSGGML_THREADS='%s'; using auto-selected CPU threads\n",
+            current.c_str());
+}
+
+static ThreadSelection runtime_threads() {
+    const char * env = std::getenv("DSGGML_THREADS");
+    if (!env || env[0] == '\0') {
+        return auto_thread_selection();
+    }
+
+    const std::string value = lower_ascii(env);
+    if (value == "auto") {
+        return auto_thread_selection();
+    }
+
+    if (is_decimal_digits(env)) {
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(env, nullptr, 10);
+        if (errno == 0 && parsed <= (unsigned long long)INT_MAX) {
+            if (parsed == 0) {
+                return auto_thread_selection();
+            }
+            ThreadSelection selected;
+            selected.threads = (int)parsed;
+            selected.automatic = false;
+            return selected;
+        }
+    }
+
+    warn_invalid_threads_once(env);
+    return auto_thread_selection();
+}
+
 static std::string cuda_device_alias(const std::string & mode) {
     if (mode == "cuda") return "CUDA0";
     if (mode.rfind("cuda:", 0) == 0) {
@@ -56,6 +235,19 @@ static std::string cuda_device_alias(const std::string & mode) {
     if (mode.rfind("cuda", 0) == 0) {
         std::string id = mode.substr(4);
         return all_digits(id) ? "CUDA" + id : "";
+    }
+    return "";
+}
+
+static std::string vulkan_device_alias(const std::string & mode) {
+    if (mode == "vulkan") return "Vulkan0";
+    if (mode.rfind("vulkan:", 0) == 0) {
+        std::string id = mode.substr(7);
+        return all_digits(id) ? "Vulkan" + id : "";
+    }
+    if (mode.rfind("vulkan", 0) == 0) {
+        std::string id = mode.substr(6);
+        return all_digits(id) ? "Vulkan" + id : "";
     }
     return "";
 }
@@ -142,6 +334,9 @@ ggml_backend_t init_backend(const char * component) {
     } else if (mode != "cpu") {
         std::string device_name = cuda_device_alias(mode);
         if (device_name.empty()) {
+            device_name = vulkan_device_alias(mode);
+        }
+        if (device_name.empty()) {
             device_name = requested;
         }
         backend = ggml_backend_init_by_name(device_name.c_str(), nullptr);
@@ -160,10 +355,17 @@ ggml_backend_t init_backend(const char * component) {
         return nullptr;
     }
     if (ggml_backend_is_cpu(backend)) {
-        const int nth = runtime_threads();
-        ggml_backend_cpu_set_n_threads(backend, nth);
-        fprintf(stderr, "[load] %s backend: %s, threads=%d\n",
-                component, ggml_backend_name(backend), nth);
+        const ThreadSelection nth = runtime_threads();
+        ggml_backend_cpu_set_n_threads(backend, nth.threads);
+        fprintf(stderr, "[load] %s backend: %s, threads=%d",
+                component, ggml_backend_name(backend), nth.threads);
+        if (nth.automatic) {
+            fprintf(stderr, " (auto");
+            if (nth.physical > 0) fprintf(stderr, ", physical=%d", nth.physical);
+            if (nth.logical > 0) fprintf(stderr, ", logical=%d", nth.logical);
+            fprintf(stderr, ")");
+        }
+        fprintf(stderr, "\n");
     } else {
         fprintf(stderr, "[load] %s backend: %s\n", component, ggml_backend_name(backend));
     }

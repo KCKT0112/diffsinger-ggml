@@ -56,6 +56,11 @@ struct Config {
     bool predict_breathiness = false;
     bool predict_voicing = false;
     bool predict_tension = false;
+    uint32_t dur_predictor_chans = 0;
+    uint32_t dur_predictor_layers = 0;
+    uint32_t dur_predictor_kernel_size = 0;
+    float dur_predictor_offset = 1.0f;
+    std::string dur_predictor_loss_type = "mse";
     FlowConfig variance;
     std::vector<VarianceTarget> variance_targets;
 };
@@ -82,6 +87,8 @@ struct VarianceSampleInputs {
     int frames = 0;
     uint32_t seed = 1234;
     std::vector<float> condition; // [T, hidden_size] row-major
+    std::vector<std::vector<float>> existing_values; // optional, one [T] curve per target
+    std::vector<std::vector<int32_t>> retake_masks;  // optional, one [T] mask per target, 1 = regenerate
 };
 
 struct VarianceSampleOutputs {
@@ -99,12 +106,30 @@ struct FS2ConditionInputs {
     std::vector<float> word_dur;    // [W], frames, word-mode variance encoder
     std::vector<int32_t> languages; // [L], optional
     std::vector<int32_t> mel2ph;    // [T], 1-based, 0 means pad
+    std::vector<int32_t> midi;      // [L], optional phoneme-level MIDI for duration predictor
 };
 
 struct ConditionOutputs {
     int frames = 0;
     int hidden = 0;
     std::vector<float> condition; // [T, hidden_size] row-major
+};
+
+struct DurationInputs {
+    int phones = 0;
+    int spk_id = -1;
+    std::vector<int32_t> tokens;    // [L]
+    std::vector<int32_t> ph2word;   // [L], 1-based word index
+    std::vector<float> word_dur;    // [W], frames per word
+    std::vector<int32_t> midi;      // [L], phoneme-level rounded MIDI
+    std::vector<int32_t> languages; // [L], optional
+};
+
+struct DurationOutputs {
+    int phones = 0;
+    std::vector<float> ph_dur;      // [L], raw predicted durations after rr alignment
+    std::vector<int32_t> ph_dur_int; // [L], rounded non-negative durations
+    std::vector<int32_t> mel2ph;    // [T], derived from ph_dur_int
 };
 
 bool run_fs2_condition(const Model & model,
@@ -114,6 +139,10 @@ bool run_fs2_condition(const Model & model,
 bool compose_variance_condition(const Model & model,
                                 const VarianceConditionInputs & in,
                                 ConditionOutputs & out);
+
+bool predict_durations(const Model & model,
+                       const DurationInputs & in,
+                       DurationOutputs & out);
 
 bool sample_variances(const Model & model,
                       const VarianceSampleInputs & in,
