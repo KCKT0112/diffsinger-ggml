@@ -157,6 +157,13 @@ set(GGML_CUDA                 ${DSGGML_CUDA} CACHE BOOL "ggml: use CUDA" FORCE)
 set(GGML_CUDA_NCCL            ${DSGGML_CUDA_NCCL} CACHE BOOL "ggml: use NCCL with CUDA" FORCE)
 set(GGML_VULKAN               ${DSGGML_VULKAN} CACHE BOOL "ggml: use Vulkan" FORCE)
 
+# On macOS, disable embedded Metal library so ggml pre-compiles a default.metallib
+# at build time. This eliminates the ~7s JIT shader compilation on cold start.
+if(APPLE)
+    set(GGML_METAL_EMBED_LIBRARY OFF CACHE BOOL "ggml: embed Metal library" FORCE)
+endif()
+
+
 function(ds_apply_git_patch_once source_dir patch_file patch_name)
     find_package(Git QUIET)
     if(NOT Git_FOUND)
@@ -215,6 +222,13 @@ if(NOT ggml_POPULATED)
             "${ggml_SOURCE_DIR}"
             "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-conv-transpose-1d-local-window.patch"
             "ggml CUDA ConvTranspose1D local-window patch"
+        )
+    endif()
+    if(APPLE)
+        ds_apply_git_patch_once(
+            "${ggml_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-binary-archive.patch"
+            "ggml Metal MTLBinaryArchive PSO cache"
         )
     endif()
     add_subdirectory("${ggml_SOURCE_DIR}" "${ggml_BINARY_DIR}")
