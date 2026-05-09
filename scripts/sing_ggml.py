@@ -258,11 +258,14 @@ def write_ds_segment(ds_path: Path,
     if segment_index < 0 or segment_index >= len(data):
         raise SystemExit(f"segment index {segment_index} out of range 0..{len(data)-1}")
     seg = data[segment_index]
-    for key in ("ph_seq", "ph_dur"):
-        if key not in seg:
-            raise SystemExit(f"segment {segment_index} missing {key}; duration-predictor DS is not supported yet")
+    if "ph_seq" not in seg:
+        raise SystemExit(f"segment {segment_index} missing ph_seq")
 
     phones = seg["ph_seq"].split()
+    if "ph_dur" not in seg:
+        raise SystemExit(
+            f"segment {segment_index} missing ph_dur; use DS pipeline mode with --auto-duration instead of manifest conversion"
+        )
     ph_dur_s = [float(x) for x in seg["ph_dur"].split()]
     if len(phones) != len(ph_dur_s):
         raise SystemExit(f"phone/duration length mismatch: {len(phones)} vs {len(ph_dur_s)}")
@@ -399,7 +402,7 @@ def prepare_ds_pipeline_manifest(args: argparse.Namespace,
 
 
 def run_ds_pipeline(args: argparse.Namespace,
-                    manifest: Path,
+                    ds_path: Path,
                     spk_id: int) -> None:
     pipeline = require(ROOT / "build/diffsinger_pipeline", "diffsinger_pipeline")
     cmd = [
@@ -407,18 +410,24 @@ def run_ds_pipeline(args: argparse.Namespace,
         "--variance-model", str(args.variance_model),
         "--acoustic-model", str(args.acoustic_model),
         "--vocoder-model", str(args.vocoder_model),
-        "--manifest", str(manifest),
+        "--ds", str(ds_path),
+        "--phonemes", str(require(args.phonemes, "phonemes map")),
+        "--out", str(args.out),
         "--spk-id", str(spk_id),
         "--seed", str(args.seed),
         "--backend", args.backend,
         "--noise-scale", str(args.vocoder_noise_scale),
     ]
+    if args.threads is not None:
+        cmd += ["--threads", args.threads]
     if args.steps > 0:
         cmd += ["--steps", str(args.steps)]
     if args.vocoder_mel_clamp:
         cmd += ["--mel-min", str(args.vocoder_mel_min), "--mel-max", str(args.vocoder_mel_max)]
     if args.predict_all_variances:
         cmd += ["--predict-all-variances"]
+    if args.auto_duration:
+        cmd += ["--auto-duration"]
     run(cmd)
 
 
@@ -456,8 +465,10 @@ def main() -> int:
     ap.add_argument("--spk-name", help="speaker name from spk_map.json; overrides --spk-id")
     ap.add_argument("--spk-map", type=Path, default=REPO / "ckpt/251228_zhibin_club_acoustic_mix-ln/spk_map.json")
     ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--backend", choices=("cpu", "gpu", "auto"), default="cpu",
-                    help="ggml backend for C++ tools; gpu/auto use the best registered ggml backend when supported")
+    ap.add_argument("--backend", default="cpu",
+                    help="ggml backend for C++ tools: cpu, gpu, auto, cuda[:N], or vulkan[:N]")
+    ap.add_argument("--threads",
+                    help="CPU threads for C++ tools: positive integer, 0, or auto")
     ap.add_argument("--steps", type=int, default=-1)
     ap.add_argument("--out", type=Path, default=Path("out.wav"))
     ap.add_argument("--vocoder-mel-min", type=float, default=-6.0)
@@ -469,6 +480,8 @@ def main() -> int:
                     help="scale NSF-HiFiGAN conv_pre noise_sigma; use 0 for deterministic vocoder alignment")
     ap.add_argument("--predict-all-variances", action="store_true",
                     help="predict all variance targets instead of only filling curves missing from the DS segment")
+    ap.add_argument("--auto-duration", action="store_true",
+                    help="use the variance model duration predictor when DS segments omit ph_dur")
     ap.set_defaults(vocoder_mel_clamp=False)
     ap.add_argument("--work-dir", type=Path)
     ap.add_argument("--keep-work", action="store_true")
@@ -518,13 +531,13 @@ def main() -> int:
         ds_path = require(args.ds_file, "ds file")
         if args.ds_all or args.ds_segment < 0:
             segments = read_ds_segments(ds_path)
-            manifest, wav_paths = prepare_ds_pipeline_manifest(args, ds_path, list(range(len(segments))), work)
-            run_ds_pipeline(args, manifest, spk_id)
-            stitch_ds_segments(segments, wav_paths, args.out)
+            full_ds = work / "segments.ds"
+            full_ds.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
+            run_ds_pipeline(args, full_ds, spk_id)
         else:
-            manifest, wav_paths = prepare_ds_pipeline_manifest(args, ds_path, [args.ds_segment], work)
-            run_ds_pipeline(args, manifest, spk_id)
-            write_wav(args.out, np.fromfile(wav_paths[0], dtype=np.float32), 44100)
+            single_ds = work / "segment.ds"
+            single_ds.write_text(json.dumps([read_ds_segments(ds_path)[args.ds_segment]], ensure_ascii=False, indent=2), encoding="utf-8")
+            run_ds_pipeline(args, single_ds, spk_id)
         print(f"[ok] wrote {args.out}")
         print(f"[work] {work}")
         return 0
@@ -585,6 +598,8 @@ def main() -> int:
         "--spk-id", str(spk_id),
         "--seed", str(args.seed),
     ]
+    if args.threads is not None:
+        var_cmd += ["--threads", args.threads]
     if phones > 0:
         var_cmd += ["--phones", str(phones)]
     run(var_cmd)
@@ -606,6 +621,8 @@ def main() -> int:
         "--seed", str(args.seed),
         "--out", str(mel),
     ]
+    if args.threads is not None:
+        acoustic_cmd += ["--threads", args.threads]
     if args.steps > 0:
         acoustic_cmd += ["--steps", str(args.steps)]
     run(acoustic_cmd)
@@ -622,6 +639,8 @@ def main() -> int:
         "--seed", str(args.seed),
         "--noise-scale", str(args.vocoder_noise_scale),
     ]
+    if args.threads is not None:
+        vocoder_cmd += ["--threads", args.threads]
     if args.vocoder_mel_clamp:
         vocoder_cmd += ["--mel-min", str(args.vocoder_mel_min), "--mel-max", str(args.vocoder_mel_max)]
     run(vocoder_cmd)

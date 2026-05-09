@@ -93,6 +93,11 @@ bool Model::load(const std::string & path) {
     cfg.use_spk_id = kbool("use_spk_id");
     cfg.use_variance_scaling = kbool("use_variance_scaling");
     cfg.use_melody_encoder = kbool("use_melody_encoder");
+    cfg.audio_sample_rate = ku32("audio_sample_rate", 44100);
+    cfg.hop_size = ku32("hop_size", 512);
+    cfg.use_glide_embed = kbool("use_glide_embed");
+    cfg.glide_embed_scale = kf32("glide_embed_scale", 1.0f);
+    cfg.midi_smooth_width = kf32("midi_smooth_width", 0.12f);
     cfg.diffusion_type = kstr("diffusion_type", "reflow");
     cfg.time_scale_factor = ku32("time_scale_factor", 1000);
     cfg.sampling_algorithm = kstr("sampling_algorithm", "euler");
@@ -163,8 +168,9 @@ bool Model::load(const std::string & path) {
             cfg.pitch.backbone_type.c_str(), cfg.pitch.channels, cfg.pitch.layers,
             cfg.pitch.kernel_size, cfg.pitch.repeat_bins, cfg.pitch.glu_type.c_str());
     if (cfg.use_melody_encoder) {
-        fprintf(stderr, "[load] melody encoder H=%u L=%u\n",
-                cfg.melody_hidden_size, cfg.melody_enc_layers);
+        fprintf(stderr, "[load] melody encoder H=%u L=%u glide=%d scale=%.3f smooth=%.3f\n",
+                cfg.melody_hidden_size, cfg.melody_enc_layers,
+                (int)cfg.use_glide_embed, cfg.glide_embed_scale, cfg.midi_smooth_width);
     }
     if (cfg.predict_voicing) {
         fprintf(stderr, "[load] voicing flow %s C=%u L=%u K=%u R=%u\n",

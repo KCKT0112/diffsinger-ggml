@@ -140,6 +140,11 @@ bool Model::load(const std::string & path) {
     cfg.predict_breathiness = get_bool(gctx, "diffsinger-variance.predict_breathiness", false);
     cfg.predict_voicing = get_bool(gctx, "diffsinger-variance.predict_voicing", false);
     cfg.predict_tension = get_bool(gctx, "diffsinger-variance.predict_tension", false);
+    cfg.dur_predictor_chans = get_u32(gctx, "diffsinger-variance.dur_predictor.hidden_size", 0);
+    cfg.dur_predictor_layers = get_u32(gctx, "diffsinger-variance.dur_predictor.num_layers", 0);
+    cfg.dur_predictor_kernel_size = get_u32(gctx, "diffsinger-variance.dur_predictor.kernel_size", 0);
+    cfg.dur_predictor_offset = get_f32(gctx, "diffsinger-variance.dur_predictor.log_offset", 1.0f);
+    cfg.dur_predictor_loss_type = get_str(gctx, "diffsinger-variance.dur_predictor.loss_type", "mse");
     load_flow(gctx, "variance", cfg.variance);
     if (!load_variance_targets(gctx, cfg)) {
         gguf_free(gctx);
@@ -173,6 +178,13 @@ bool Model::load(const std::string & path) {
             cfg.variance.backbone_type.c_str(), cfg.variance.channels, cfg.variance.layers,
             cfg.variance.kernel_size, cfg.variance.total_repeat_bins,
             cfg.variance.glu_type.c_str(), (int)cfg.variance.use_conditioner_cache);
+    if (cfg.predict_dur) {
+        fprintf(stderr,
+                "[load] dur predictor C=%u L=%u K=%u offset=%.3f loss=%s\n",
+                cfg.dur_predictor_chans, cfg.dur_predictor_layers,
+                cfg.dur_predictor_kernel_size, cfg.dur_predictor_offset,
+                cfg.dur_predictor_loss_type.c_str());
+    }
     if (!cfg.variance_targets.empty()) {
         fprintf(stderr, "[load] variance targets:");
         for (const auto & t : cfg.variance_targets) {

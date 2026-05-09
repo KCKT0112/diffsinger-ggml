@@ -36,8 +36,8 @@ static ggml_tensor * conv1d_k1_as_linear(ggml_context * ctx,
 
 static ggml_tensor * atanglu(ggml_context * ctx, ggml_tensor * x) {
     const int64_t c = x->ne[0] / 2;
-    ggml_tensor * out = ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], 0);
-    ggml_tensor * gate = ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], c * x->nb[0]);
+    ggml_tensor * out = ggml_cont(ctx, ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], 0));
+    ggml_tensor * gate = ggml_cont(ctx, ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], c * x->nb[0]));
     const float pi_half = 1.5707963267948966f;
     ggml_tensor * sx  = ggml_sgn(ctx, gate);
     ggml_tensor * ax  = ggml_abs(ctx, gate);
@@ -200,8 +200,8 @@ static ggml_tensor * lynx_block(ggml_context * ctx,
     return ggml_add(ctx, x, h);
 }
 
-static std::vector<float> sinusoidal_embedding(int dim, float x) {
-    std::vector<float> out((size_t)dim);
+static void fill_sinusoidal_embedding(std::vector<float> & out, int dim, float x) {
+    out.assign((size_t)dim, 0.0f);
     const int half = dim / 2;
     const float denom = half > 1 ? (float)(half - 1) : 1.0f;
     const float scale = std::log(10000.0f) / denom;
@@ -210,95 +210,304 @@ static std::vector<float> sinusoidal_embedding(int dim, float x) {
         out[(size_t)i] = std::sin(v);
         out[(size_t)half + i] = std::cos(v);
     }
+}
+
+struct TensorData {
+    std::vector<float> data;
+    int64_t ne[4] = { 1, 1, 1, 1 };
+};
+
+static bool fetch_tensor_f32(const Model & m,
+                             const std::string & name,
+                             TensorData & out,
+                             bool optional = false) {
+    ggml_tensor * t = m.get(name, optional);
+    if (!t) return optional;
+    if (t->type != GGML_TYPE_F32) {
+        fprintf(stderr, "[err] tensor %s has unsupported type %d for CPU helper path\n",
+                name.c_str(), (int)t->type);
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) out.ne[i] = t->ne[i];
+    out.data.resize(ggml_nelements(t));
+    ggml_backend_tensor_get(t, out.data.data(), 0, out.data.size() * sizeof(float));
+    return true;
+}
+
+static void embedding_lookup(const TensorData & weight,
+                             const std::vector<int32_t> & ids,
+                             std::vector<float> & out) {
+    const int dim = (int)weight.ne[0];
+    const int rows = (int)weight.ne[1];
+    out.resize(ids.size() * (size_t)dim);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        int idx = ids[i];
+        if (idx < 0) idx = 0;
+        if (idx >= rows) idx = rows - 1;
+        const float * src = weight.data.data() + (size_t)idx * dim;
+        std::memcpy(out.data() + i * (size_t)dim, src, (size_t)dim * sizeof(float));
+    }
+}
+
+static std::vector<float> linear_row_major(const std::vector<float> & x,
+                                           int T,
+                                           int in_dim,
+                                           const TensorData & weight,
+                                           const TensorData & bias) {
+    const int out_dim = (int)weight.ne[1];
+    std::vector<float> y((size_t)T * out_dim, 0.0f);
+    for (int t = 0; t < T; ++t) {
+        const float * xv = x.data() + (size_t)t * in_dim;
+        float * yv = y.data() + (size_t)t * out_dim;
+        for (int o = 0; o < out_dim; ++o) {
+            float sum = bias.data.empty() ? 0.0f : bias.data[(size_t)o];
+            const float * w = weight.data.data() + (size_t)o * in_dim;
+            for (int i = 0; i < in_dim; ++i) sum += w[i] * xv[i];
+            yv[o] = sum;
+        }
+    }
+    return y;
+}
+
+static std::vector<float> smooth_base_pitch(const Config & c, const std::vector<float> & midi) {
+    const int T = (int)midi.size();
+    if (T <= 1) return midi;
+    const float timestep = (float)c.hop_size / (float)std::max<uint32_t>(c.audio_sample_rate, 1);
+    int kernel_size = (int)std::lround(c.midi_smooth_width / std::max(timestep, 1e-6f));
+    if (kernel_size <= 1) return midi;
+    kernel_size = std::min(kernel_size, T | 1);
+    if ((kernel_size & 1) == 0) ++kernel_size;
+    const int pad = kernel_size / 2;
+    std::vector<float> kernel((size_t)kernel_size, 0.0f);
+    float denom = 0.0f;
+    for (int i = 0; i < kernel_size; ++i) {
+        float v = std::sin((float)i / (float)(kernel_size - 1) * 3.14159265358979323846f);
+        kernel[(size_t)i] = v;
+        denom += v;
+    }
+    if (denom <= 0.0f) return midi;
+    for (float & v : kernel) v /= denom;
+
+    std::vector<float> out((size_t)T, 0.0f);
+    for (int t = 0; t < T; ++t) {
+        float sum = 0.0f;
+        for (int k = 0; k < kernel_size; ++k) {
+            int src = t + k - pad;
+            if (src < 0) src = 0;
+            if (src >= T) src = T - 1;
+            sum += kernel[(size_t)k] * midi[(size_t)src];
+        }
+        out[(size_t)t] = sum;
+    }
     return out;
 }
 
-// Run velocity network for pitch or variance flow
-static bool run_velocity(const Model & m,
-                         const std::string & pfx,
-                         const FlowConfig & fc,
-                         int T, int bins,
-                         float diffusion_step,
-                         const std::vector<float> & spec,
-                         const std::vector<float> & cond,
-                         int hidden_size,
-                         std::vector<float> & velocity_out) {
+static bool compute_conditioner_projection(const Model & m,
+                                           const std::string & pfx,
+                                           const FlowConfig & fc,
+                                           int T,
+                                           int hidden_size,
+                                           const std::vector<float> & cond,
+                                           std::vector<float> & projection_out) {
     if (fc.backbone_type != "lynxnet2") {
         fprintf(stderr, "[err] only lynxnet2 backbone supported\n");
         return false;
     }
+    if (T <= 0 || hidden_size <= 0 || fc.channels == 0) {
+        fprintf(stderr, "[err] invalid conditioner projection shape\n");
+        return false;
+    }
+    if (cond.size() != (size_t)T * hidden_size) {
+        fprintf(stderr, "[err] conditioner size mismatch\n");
+        return false;
+    }
 
-    std::vector<float> diff = sinusoidal_embedding((int)fc.channels, diffusion_step);
-
-    ggml_init_params ip_in { ggml_tensor_overhead() * 8, nullptr, true };
+    ggml_init_params ip_in { ggml_tensor_overhead() * 4, nullptr, true };
     ggml_context * ctx_in = ggml_init(ip_in);
-    ggml_tensor * spec_in = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, bins, T);
-    ggml_set_input(spec_in); ggml_set_name(spec_in, "spec");
     ggml_tensor * cond_in = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, hidden_size, T);
     ggml_set_input(cond_in); ggml_set_name(cond_in, "cond");
-    ggml_tensor * diff_in = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, fc.channels, 1);
-    ggml_set_input(diff_in); ggml_set_name(diff_in, "diff");
 
-    ggml_init_params ip { 768ULL * 1024 * 1024, nullptr, true };
+    ggml_init_params ip { 256ULL * 1024 * 1024, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 64, false);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 8, false);
 
-    ggml_tensor * x = linear(ctx, m, pfx + ".vf.in", spec_in);
+    ggml_tensor * proj = nullptr;
     if (fc.use_conditioner_cache) {
-        x = ggml_add(ctx, x, conv1d_k1_as_linear(ctx, m, pfx + ".vf.cond", cond_in));
+        proj = conv1d_k1_as_linear(ctx, m, pfx + ".vf.cond", cond_in);
     } else {
-        x = ggml_add(ctx, x, linear(ctx, m, pfx + ".vf.cond", cond_in));
+        proj = linear(ctx, m, pfx + ".vf.cond", cond_in);
     }
-
-    ggml_tensor * d = linear(ctx, m, pfx + ".vf.diff.1", diff_in);
-    d = ggml_gelu_erf(ctx, d);
-    d = linear(ctx, m, pfx + ".vf.diff.3", d);
-    x = ggml_add(ctx, x, d);
-
-    for (uint32_t li = 0; li < fc.layers; ++li) {
-        x = lynx_block(ctx, m, pfx, x, (int)li, (int)fc.kernel_size);
-    }
-    x = ggml_norm(ctx, x, 1e-5f);
-    x = ggml_add(ctx,
-        ggml_mul(ctx, x, m.get(pfx + ".vf.norm.weight")),
-        m.get(pfx + ".vf.norm.bias"));
-    x = linear(ctx, m, pfx + ".vf.out", x);
-    ggml_set_output(x);
-    ggml_set_name(x, "velocity");
-    ggml_build_forward_expand(gf, x);
+    ggml_set_output(proj);
+    ggml_set_name(proj, "conditioner_projection");
+    ggml_build_forward_expand(gf, proj);
 
     ggml_backend_buffer_t in_buf = ggml_backend_alloc_ctx_tensors(ctx_in, m.backend);
     if (!in_buf) {
-        fprintf(stderr, "[fatal] pitch velocity input buffer alloc failed\n");
+        fprintf(stderr, "[fatal] pitch conditioner input buffer alloc failed\n");
         ggml_free(ctx); ggml_free(ctx_in);
         return false;
     }
     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     if (!ggml_gallocr_alloc_graph(ga, gf)) {
-        fprintf(stderr, "[fatal] pitch velocity graph alloc failed\n");
+        fprintf(stderr, "[fatal] pitch conditioner graph alloc failed\n");
         ggml_gallocr_free(ga); ggml_backend_buffer_free(in_buf);
         ggml_free(ctx); ggml_free(ctx_in);
         return false;
     }
 
-    ggml_backend_tensor_set(spec_in, spec.data(), 0, spec.size() * sizeof(float));
     ggml_backend_tensor_set(cond_in, cond.data(), 0, cond.size() * sizeof(float));
-    ggml_backend_tensor_set(diff_in, diff.data(), 0, diff.size() * sizeof(float));
     ggml_status st = ggml_backend_graph_compute(m.backend, gf);
     if (st != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[fatal] pitch velocity compute = %d\n", (int)st);
+        fprintf(stderr, "[fatal] pitch conditioner compute = %d\n", (int)st);
         ggml_gallocr_free(ga); ggml_backend_buffer_free(in_buf);
         ggml_free(ctx); ggml_free(ctx_in);
         return false;
     }
 
-    velocity_out.resize((size_t)T * bins);
-    ggml_backend_tensor_get(x, velocity_out.data(), 0, velocity_out.size() * sizeof(float));
+    projection_out.resize((size_t)T * fc.channels);
+    ggml_backend_tensor_get(proj, projection_out.data(), 0, projection_out.size() * sizeof(float));
 
     ggml_gallocr_free(ga); ggml_backend_buffer_free(in_buf);
     ggml_free(ctx); ggml_free(ctx_in);
     return true;
 }
+
+// Single-step velocity network reused within one pitch or voicing sampler call.
+struct VelocityGraph {
+    const Model * model = nullptr;
+    const FlowConfig * flow = nullptr;
+    std::string prefix;
+    int frames = 0;
+    int bins = 0;
+    int channels = 0;
+
+    ggml_context * ctx_in = nullptr;
+    ggml_context * ctx = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * spec_in = nullptr;
+    ggml_tensor * cond_proj_in = nullptr;
+    ggml_tensor * diff_in = nullptr;
+    ggml_tensor * velocity = nullptr;
+    ggml_backend_buffer_t in_buf = nullptr;
+    ggml_gallocr_t ga = nullptr;
+
+    std::vector<float> diff;
+    bool have_cached_diff = false;
+    float cached_diffusion_step = 0.0f;
+
+    ~VelocityGraph() {
+        if (ga) ggml_gallocr_free(ga);
+        if (in_buf) ggml_backend_buffer_free(in_buf);
+        if (ctx) ggml_free(ctx);
+        if (ctx_in) ggml_free(ctx_in);
+    }
+
+    bool init(const Model & m,
+              const std::string & pfx,
+              const FlowConfig & fc,
+              int T,
+              int bins_in,
+              const std::vector<float> & conditioner_projection) {
+        if (fc.backbone_type != "lynxnet2") {
+            fprintf(stderr, "[err] only lynxnet2 backbone supported\n");
+            return false;
+        }
+        if (T <= 0 || bins_in <= 0 || fc.channels == 0) {
+            fprintf(stderr, "[err] invalid velocity graph shape\n");
+            return false;
+        }
+        if (conditioner_projection.size() != (size_t)T * fc.channels) {
+            fprintf(stderr, "[err] conditioner projection size mismatch\n");
+            return false;
+        }
+
+        model = &m;
+        flow = &fc;
+        prefix = pfx;
+        frames = T;
+        bins = bins_in;
+        channels = (int)fc.channels;
+
+        ggml_init_params ip_in { ggml_tensor_overhead() * 8, nullptr, true };
+        ctx_in = ggml_init(ip_in);
+        if (!ctx_in) return false;
+        spec_in = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, bins, frames);
+        ggml_set_input(spec_in); ggml_set_name(spec_in, "spec");
+        cond_proj_in = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, channels, frames);
+        ggml_set_input(cond_proj_in); ggml_set_name(cond_proj_in, "cond_proj");
+        diff_in = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, channels, 1);
+        ggml_set_input(diff_in); ggml_set_name(diff_in, "diff");
+
+        ggml_init_params ip { 768ULL * 1024 * 1024, nullptr, true };
+        ctx = ggml_init(ip);
+        if (!ctx) return false;
+        graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 64, false);
+
+        ggml_tensor * x = linear(ctx, m, prefix + ".vf.in", spec_in);
+        x = ggml_add(ctx, x, cond_proj_in);
+
+        ggml_tensor * d = linear(ctx, m, prefix + ".vf.diff.1", diff_in);
+        d = ggml_gelu_erf(ctx, d);
+        d = linear(ctx, m, prefix + ".vf.diff.3", d);
+        x = ggml_add(ctx, x, d);
+
+        for (uint32_t li = 0; li < fc.layers; ++li) {
+            x = lynx_block(ctx, m, prefix, x, (int)li, (int)fc.kernel_size);
+        }
+        x = ggml_norm(ctx, x, 1e-5f);
+        x = ggml_add(ctx,
+            ggml_mul(ctx, x, m.get(prefix + ".vf.norm.weight")),
+            m.get(prefix + ".vf.norm.bias"));
+        velocity = linear(ctx, m, prefix + ".vf.out", x);
+        ggml_set_output(velocity);
+        ggml_set_name(velocity, "velocity");
+        ggml_build_forward_expand(graph, velocity);
+
+        in_buf = ggml_backend_alloc_ctx_tensors(ctx_in, m.backend);
+        if (!in_buf) {
+            fprintf(stderr, "[fatal] pitch velocity input buffer alloc failed\n");
+            return false;
+        }
+        ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        if (!ggml_gallocr_alloc_graph(ga, graph)) {
+            fprintf(stderr, "[fatal] pitch velocity graph alloc failed\n");
+            return false;
+        }
+
+        ggml_backend_tensor_set(cond_proj_in, conditioner_projection.data(), 0,
+                                conditioner_projection.size() * sizeof(float));
+        return true;
+    }
+
+    bool eval(const std::vector<float> & spec,
+              float diffusion_step,
+              std::vector<float> & velocity_out) {
+        if (!model || !flow || !spec_in || !diff_in || !velocity) return false;
+        if (spec.size() != (size_t)frames * bins) {
+            fprintf(stderr, "[err] spec size mismatch\n");
+            return false;
+        }
+
+        ggml_backend_tensor_set(spec_in, spec.data(), 0, spec.size() * sizeof(float));
+        if (!have_cached_diff || diffusion_step != cached_diffusion_step) {
+            fill_sinusoidal_embedding(diff, channels, diffusion_step);
+            ggml_backend_tensor_set(diff_in, diff.data(), 0, diff.size() * sizeof(float));
+            cached_diffusion_step = diffusion_step;
+            have_cached_diff = true;
+        }
+
+        ggml_status st = ggml_backend_graph_compute(model->backend, graph);
+        if (st != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "[fatal] pitch velocity compute = %d\n", (int)st);
+            return false;
+        }
+
+        velocity_out.resize((size_t)frames * bins);
+        ggml_backend_tensor_get(velocity, velocity_out.data(), 0,
+                                velocity_out.size() * sizeof(float));
+        return true;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // FS2 Encoder (pitch model uses ph_dur_embed, not word_dur + onset)
@@ -441,6 +650,7 @@ static bool run_melody_encoder(const Model & m, const PitchInputs & in,
     std::vector<float> midi_input(N);
     std::vector<float> dur_input(N);
     std::vector<float> nonpad(N);
+    std::vector<float> rest_keep(N);
     std::vector<float> attn_mask(N);
     for (int i = 0; i < N; ++i) {
         float midi = in.note_midi[i];
@@ -454,6 +664,7 @@ static bool run_melody_encoder(const Model & m, const PitchInputs & in,
             dur_input[i] = (float)in.note_dur[i];
         }
         nonpad[i] = is_pad ? 0.0f : 1.0f;
+        rest_keep[i] = is_rest ? 0.0f : 1.0f;
         attn_mask[i] = is_pad ? -INFINITY : 0.0f;
     }
 
@@ -465,12 +676,19 @@ static bool run_melody_encoder(const Model & m, const PitchInputs & in,
     ggml_set_input(dur_t); ggml_set_name(dur_t, "dur");
     ggml_tensor * nonpad_t = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, 1, N);
     ggml_set_input(nonpad_t); ggml_set_name(nonpad_t, "mel_nonpad");
+    ggml_tensor * rest_keep_t = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, 1, N);
+    ggml_set_input(rest_keep_t); ggml_set_name(rest_keep_t, "rest_keep");
     ggml_tensor * attn_mask_t = ggml_new_tensor_1d(ctx_in, GGML_TYPE_F32, N);
     ggml_set_input(attn_mask_t); ggml_set_name(attn_mask_t, "mel_attn_mask");
     ggml_tensor * pos_t = nullptr;
     if (c.use_rope) {
         pos_t = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I32, N);
         ggml_set_input(pos_t); ggml_set_name(pos_t, "mel_pos");
+    }
+    ggml_tensor * glide_t = nullptr;
+    if (c.use_glide_embed) {
+        glide_t = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I32, N);
+        ggml_set_input(glide_t); ggml_set_name(glide_t, "glide");
     }
     ggml_tensor * mel2note_t = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I32, T);
     ggml_set_input(mel2note_t); ggml_set_name(mel2note_t, "mel2note");
@@ -484,11 +702,14 @@ static bool run_melody_encoder(const Model & m, const PitchInputs & in,
 
     // note_midi_embed(midi) * ~rest_mask
     ggml_tensor * midi_emb = linear(ctx, m, "mel.midi_embed", midi_t);
-    // Apply rest mask: midi_embed[i] = 0 if rest
-    midi_emb = ggml_mul(ctx, midi_emb, nonpad_t);  // nonpad also masks rest (we set midi_input=0 for rest)
+    midi_emb = ggml_mul(ctx, midi_emb, rest_keep_t);
 
     // note_dur_embed(dur)
     ggml_tensor * dur_emb = linear(ctx, m, "mel.dur_embed", dur_t);
+    if (c.use_glide_embed && glide_t) {
+        ggml_tensor * glide_emb = ggml_get_rows(ctx, m.get("mel.note_glide_embed.weight"), glide_t);
+        dur_emb = ggml_add(ctx, dur_emb, ggml_scale(ctx, glide_emb, c.glide_embed_scale));
+    }
 
     // Run melody encoder transformer
     ggml_tensor * enc = run_encoder_graph(ctx, m, "mel", midi_emb, dur_emb, nonpad_t, attn_mask_t, pos_t,
@@ -520,11 +741,15 @@ static bool run_melody_encoder(const Model & m, const PitchInputs & in,
     ggml_backend_tensor_set(midi_t, midi_input.data(), 0, N * sizeof(float));
     ggml_backend_tensor_set(dur_t, dur_input.data(), 0, N * sizeof(float));
     ggml_backend_tensor_set(nonpad_t, nonpad.data(), 0, N * sizeof(float));
+    ggml_backend_tensor_set(rest_keep_t, rest_keep.data(), 0, N * sizeof(float));
     ggml_backend_tensor_set(attn_mask_t, attn_mask.data(), 0, N * sizeof(float));
     if (pos_t) {
         std::vector<int32_t> positions(N);
         for (int i = 0; i < N; ++i) positions[i] = i;
         ggml_backend_tensor_set(pos_t, positions.data(), 0, N * sizeof(int32_t));
+    }
+    if (glide_t) {
+        ggml_backend_tensor_set(glide_t, in.note_glide.data(), 0, N * sizeof(int32_t));
     }
     ggml_backend_tensor_set(mel2note_t, in.mel2note.data(), 0, T * sizeof(int32_t));
     std::vector<float> zero_vec(out_H, 0.0f);
@@ -557,66 +782,62 @@ static bool compose_pitch_condition(const Model & m,
     const Config & c = m.cfg;
     const int T = in.frames;
     const int H = (int)c.hidden_size;
-
-    // pitch_cond = fs2_cond + melody_cond + retake_embed(1) + delta_pitch_embed(0)
-    // retake_embed: row 1 of [2, H] embedding (full retake during inference)
-    // delta_pitch_embed: Linear(0) = bias only (input is all zeros)
-
-    ggml_init_params ip_in { ggml_tensor_overhead() * 4, nullptr, true };
-    ggml_context * ctx_in = ggml_init(ip_in);
-    ggml_tensor * fs2_t = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, H, T);
-    ggml_set_input(fs2_t); ggml_set_name(fs2_t, "fs2");
-    ggml_tensor * mel_t = ggml_new_tensor_2d(ctx_in, GGML_TYPE_F32, H, T);
-    ggml_set_input(mel_t); ggml_set_name(mel_t, "mel");
-    // Retake index: all 1s (retake = regenerate)
-    ggml_tensor * retake_idx = ggml_new_tensor_1d(ctx_in, GGML_TYPE_I32, T);
-    ggml_set_input(retake_idx); ggml_set_name(retake_idx, "retake");
-
-    ggml_init_params ip { 128ULL * 1024 * 1024, nullptr, true };
-    ggml_context * ctx = ggml_init(ip);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
-
-    ggml_tensor * cond = ggml_add(ctx, fs2_t, mel_t);
-    // pitch_retake_embed(1) for all frames
-    ggml_tensor * retake_emb = ggml_get_rows(ctx, m.get("pitch_retake_embed.weight"), retake_idx);
-    cond = ggml_add(ctx, cond, retake_emb);
-    // delta_pitch_embed(0): just the bias since input is 0
-    // But to be correct through the graph, we add the bias directly
-    cond = ggml_add(ctx, cond, m.get("delta_pitch_embed.bias"));
-    ggml_set_output(cond);
-    ggml_set_name(cond, "pitch_cond");
-    ggml_build_forward_expand(gf, cond);
-
-    ggml_backend_buffer_t in_buf = ggml_backend_alloc_ctx_tensors(ctx_in, m.backend);
-    if (!in_buf) {
-        ggml_free(ctx); ggml_free(ctx_in);
-        return false;
-    }
-    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    if (!ggml_gallocr_alloc_graph(ga, gf)) {
-        ggml_gallocr_free(ga); ggml_backend_buffer_free(in_buf);
-        ggml_free(ctx); ggml_free(ctx_in);
+    const std::vector<float> smoothed_base = smooth_base_pitch(c, in.base_pitch);
+    if (fs2_cond.size() != (size_t)T * H || melody_cond.size() != (size_t)T * H ||
+        in.base_pitch.size() != (size_t)T) {
+        fprintf(stderr, "[err] pitch condition input size mismatch\n");
         return false;
     }
 
-    ggml_backend_tensor_set(fs2_t, fs2_cond.data(), 0, fs2_cond.size() * sizeof(float));
-    ggml_backend_tensor_set(mel_t, melody_cond.data(), 0, melody_cond.size() * sizeof(float));
-    std::vector<int32_t> retake_ones(T, 1);
-    ggml_backend_tensor_set(retake_idx, retake_ones.data(), 0, T * sizeof(int32_t));
+    TensorData retake_w, delta_w, delta_b;
+    if (!fetch_tensor_f32(m, "pitch_retake_embed.weight", retake_w)) return false;
+    if (!fetch_tensor_f32(m, "delta_pitch_embed.weight", delta_w)) return false;
+    if (!fetch_tensor_f32(m, "delta_pitch_embed.bias", delta_b)) return false;
 
-    ggml_status st = ggml_backend_graph_compute(m.backend, gf);
-    if (st != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[fatal] pitch condition compose = %d\n", (int)st);
-        ggml_gallocr_free(ga); ggml_backend_buffer_free(in_buf);
-        ggml_free(ctx); ggml_free(ctx_in);
+    std::vector<int32_t> pitch_retake;
+    if (in.pitch_retake.empty()) pitch_retake.assign((size_t)T, 1);
+    else pitch_retake = in.pitch_retake;
+    if ((int)pitch_retake.size() != T) {
+        fprintf(stderr, "[err] pitch_retake size mismatch\n");
         return false;
     }
 
-    pitch_cond_out.resize((size_t)T * H);
-    ggml_backend_tensor_get(cond, pitch_cond_out.data(), 0, pitch_cond_out.size() * sizeof(float));
+    std::vector<float> retake_embed;
+    embedding_lookup(retake_w, pitch_retake, retake_embed);
 
-    ggml_gallocr_free(ga); ggml_backend_buffer_free(in_buf);
-    ggml_free(ctx); ggml_free(ctx_in);
+    std::vector<float> delta_in((size_t)T, 0.0f);
+    if (!in.pitch.empty()) {
+        if ((int)in.pitch.size() != T) {
+            fprintf(stderr, "[err] existing pitch size mismatch\n");
+            return false;
+        }
+        for (int t = 0; t < T; ++t) {
+            if (pitch_retake[(size_t)t] == 0) {
+                delta_in[(size_t)t] = in.pitch[(size_t)t] - smoothed_base[(size_t)t];
+            }
+        }
+    }
+    std::vector<float> delta_embed = linear_row_major(delta_in, T, 1, delta_w, delta_b);
+
+    pitch_cond_out.resize((size_t)T * H, 0.0f);
+    for (int t = 0; t < T; ++t) {
+        const float expr = (!in.pitch_expr.empty() && (int)in.pitch_expr.size() == T)
+            ? std::clamp(in.pitch_expr[(size_t)t], 0.0f, 1.0f) * (float)pitch_retake[(size_t)t]
+            : (float)pitch_retake[(size_t)t];
+        for (int h = 0; h < H; ++h) {
+            const size_t idx = (size_t)t * H + h;
+            const float retake_true = retake_w.data[(size_t)H + h];
+            const float retake_false = retake_w.data[(size_t)h];
+            const float retake_mix = in.pitch_expr.empty()
+                ? retake_embed[idx]
+                : expr * retake_true + (1.0f - expr) * retake_false;
+            pitch_cond_out[idx] =
+                fs2_cond[idx] +
+                melody_cond[idx] +
+                retake_mix +
+                delta_embed[idx];
+        }
+    }
     return true;
 }
 
@@ -684,6 +905,7 @@ bool run_pitch_inference(const Model & m, const PitchInputs & in, PitchOutputs &
     const Config & c = m.cfg;
     const int T = in.frames;
     const int H = (int)c.hidden_size;
+    const std::vector<float> smoothed_base = smooth_base_pitch(c, in.base_pitch);
 
     if (T <= 0 || in.phones <= 0) {
         fprintf(stderr, "[err] pitch: frames and phones must be positive\n");
@@ -704,7 +926,9 @@ bool run_pitch_inference(const Model & m, const PitchInputs & in, PitchOutputs &
 
     // 3. Compose pitch condition
     std::vector<float> pitch_cond;
-    if (!compose_pitch_condition(m, in, fs2_cond, melody_cond, pitch_cond)) return false;
+    PitchInputs cond_in = in;
+    cond_in.base_pitch = smoothed_base;
+    if (!compose_pitch_condition(m, cond_in, fs2_cond, melody_cond, pitch_cond)) return false;
 
     // 4. Pitch reflow sampling
     const int R = (int)c.pitch.repeat_bins;
@@ -732,28 +956,31 @@ bool run_pitch_inference(const Model & m, const PitchInputs & in, PitchOutputs &
         }
     }
 
+    std::vector<float> pitch_cond_proj;
+    if (!compute_conditioner_projection(m, "pitch", c.pitch, T, H, pitch_cond,
+                                        pitch_cond_proj)) return false;
+    VelocityGraph pitch_velocity;
+    if (!pitch_velocity.init(m, "pitch", c.pitch, T, R, pitch_cond_proj)) return false;
+
     auto eval_pitch_velocity = [&](const std::vector<float> & x_eval, float t_eval,
-                                    std::vector<float> & v_out) -> bool {
+                                   std::vector<float> & v_out) -> bool {
         float diff_step = (float)c.time_scale_factor * t_eval;
-        return run_velocity(m, "pitch", c.pitch, T, R, diff_step, x_eval, pitch_cond, H, v_out);
+        return pitch_velocity.eval(x_eval, diff_step, v_out);
     };
 
+    std::vector<float> v1, v2, k1, k2, k3, k4;
+    std::vector<float> x_tmp(x.size());
     for (int i = 0; i < steps; ++i) {
         float t_i = (float)i * dt;
         if (alg == "midpoint" || alg == "rk2") {
-            std::vector<float> v1;
             if (!eval_pitch_velocity(x, t_i, v1)) return false;
-            std::vector<float> x_mid(x.size());
             for (size_t j = 0; j < x.size(); ++j)
-                x_mid[j] = x[j] + 0.5f * dt * v1[j];
-            std::vector<float> v2;
-            if (!eval_pitch_velocity(x_mid, t_i + 0.5f * dt, v2)) return false;
+                x_tmp[j] = x[j] + 0.5f * dt * v1[j];
+            if (!eval_pitch_velocity(x_tmp, t_i + 0.5f * dt, v2)) return false;
             for (size_t j = 0; j < x.size(); ++j)
                 x[j] += dt * v2[j];
         } else if (alg == "rk4") {
-            std::vector<float> k1, k2, k3, k4;
             if (!eval_pitch_velocity(x, t_i, k1)) return false;
-            std::vector<float> x_tmp(x.size());
             for (size_t j = 0; j < x.size(); ++j) x_tmp[j] = x[j] + 0.5f * dt * k1[j];
             if (!eval_pitch_velocity(x_tmp, t_i + 0.5f * dt, k2)) return false;
             for (size_t j = 0; j < x.size(); ++j) x_tmp[j] = x[j] + 0.5f * dt * k2[j];
@@ -764,7 +991,6 @@ bool run_pitch_inference(const Model & m, const PitchInputs & in, PitchOutputs &
                 x[j] += dt / 6.0f * (k1[j] + 2.f*k2[j] + 2.f*k3[j] + k4[j]);
         } else {
             // Euler
-            std::vector<float> v1;
             if (!eval_pitch_velocity(x, t_i, v1)) return false;
             for (size_t j = 0; j < x.size(); ++j)
                 x[j] += dt * v1[j];
@@ -794,7 +1020,7 @@ bool run_pitch_inference(const Model & m, const PitchInputs & in, PitchOutputs &
     out.pitch_midi.resize(T);
     out.f0_hz.resize(T);
     for (int t = 0; t < T; ++t) {
-        float midi = in.base_pitch[t] + pitch_delta[t];
+        float midi = smoothed_base[(size_t)t] + pitch_delta[t];
         out.pitch_midi[t] = midi;
         if (in.base_pitch[t] > 0.0f) {
             out.f0_hz[t] = 440.0f * std::pow(2.0f, (midi - 69.0f) / 12.0f);
@@ -814,38 +1040,40 @@ bool run_pitch_inference(const Model & m, const PitchInputs & in, PitchOutputs &
         std::vector<float> vx((size_t)T * var_R);
         for (float & v : vx) v = norm(rng);
 
+        std::vector<float> var_cond_proj;
+        if (!compute_conditioner_projection(m, "var", c.variance, T, H, var_cond,
+                                            var_cond_proj)) return false;
+        VelocityGraph var_velocity;
+        if (!var_velocity.init(m, "var", c.variance, T, var_R, var_cond_proj)) return false;
+
         auto eval_var_velocity = [&](const std::vector<float> & x_eval, float t_eval,
-                                      std::vector<float> & v_out) -> bool {
+                                     std::vector<float> & v_out) -> bool {
             float diff_step = (float)c.time_scale_factor * t_eval;
-            return run_velocity(m, "var", c.variance, T, var_R, diff_step, x_eval, var_cond, H, v_out);
+            return var_velocity.eval(x_eval, diff_step, v_out);
         };
 
+        std::vector<float> vv1, vv2, vk1, vk2, vk3, vk4;
+        std::vector<float> vx_tmp(vx.size());
         for (int i = 0; i < var_steps; ++i) {
             float t_i = (float)i * dt;
             if (alg == "midpoint" || alg == "rk2") {
-                std::vector<float> v1;
-                if (!eval_var_velocity(vx, t_i, v1)) return false;
-                std::vector<float> x_mid(vx.size());
-                for (size_t j = 0; j < vx.size(); ++j) x_mid[j] = vx[j] + 0.5f * dt * v1[j];
-                std::vector<float> v2;
-                if (!eval_var_velocity(x_mid, t_i + 0.5f * dt, v2)) return false;
-                for (size_t j = 0; j < vx.size(); ++j) vx[j] += dt * v2[j];
+                if (!eval_var_velocity(vx, t_i, vv1)) return false;
+                for (size_t j = 0; j < vx.size(); ++j) vx_tmp[j] = vx[j] + 0.5f * dt * vv1[j];
+                if (!eval_var_velocity(vx_tmp, t_i + 0.5f * dt, vv2)) return false;
+                for (size_t j = 0; j < vx.size(); ++j) vx[j] += dt * vv2[j];
             } else if (alg == "rk4") {
-                std::vector<float> k1, k2, k3, k4;
-                if (!eval_var_velocity(vx, t_i, k1)) return false;
-                std::vector<float> x_tmp(vx.size());
-                for (size_t j = 0; j < vx.size(); ++j) x_tmp[j] = vx[j] + 0.5f * dt * k1[j];
-                if (!eval_var_velocity(x_tmp, t_i + 0.5f * dt, k2)) return false;
-                for (size_t j = 0; j < vx.size(); ++j) x_tmp[j] = vx[j] + 0.5f * dt * k2[j];
-                if (!eval_var_velocity(x_tmp, t_i + 0.5f * dt, k3)) return false;
-                for (size_t j = 0; j < vx.size(); ++j) x_tmp[j] = vx[j] + dt * k3[j];
-                if (!eval_var_velocity(x_tmp, t_i + dt, k4)) return false;
+                if (!eval_var_velocity(vx, t_i, vk1)) return false;
+                for (size_t j = 0; j < vx.size(); ++j) vx_tmp[j] = vx[j] + 0.5f * dt * vk1[j];
+                if (!eval_var_velocity(vx_tmp, t_i + 0.5f * dt, vk2)) return false;
+                for (size_t j = 0; j < vx.size(); ++j) vx_tmp[j] = vx[j] + 0.5f * dt * vk2[j];
+                if (!eval_var_velocity(vx_tmp, t_i + 0.5f * dt, vk3)) return false;
+                for (size_t j = 0; j < vx.size(); ++j) vx_tmp[j] = vx[j] + dt * vk3[j];
+                if (!eval_var_velocity(vx_tmp, t_i + dt, vk4)) return false;
                 for (size_t j = 0; j < vx.size(); ++j)
-                    vx[j] += dt / 6.0f * (k1[j] + 2.f*k2[j] + 2.f*k3[j] + k4[j]);
+                    vx[j] += dt / 6.0f * (vk1[j] + 2.f*vk2[j] + 2.f*vk3[j] + vk4[j]);
             } else {
-                std::vector<float> v1;
-                if (!eval_var_velocity(vx, t_i, v1)) return false;
-                for (size_t j = 0; j < vx.size(); ++j) vx[j] += dt * v1[j];
+                if (!eval_var_velocity(vx, t_i, vv1)) return false;
+                for (size_t j = 0; j < vx.size(); ++j) vx[j] += dt * vv1[j];
             }
         }
 

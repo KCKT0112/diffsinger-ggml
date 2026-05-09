@@ -15,7 +15,8 @@ static void usage() {
         "usage: diffsinger_vocoder --model <vocoder.gguf> [--inspect]\n"
         "                         [--mel-bin <mel.f32> --f0-bin <f0.f32> --frames <T> --out <wav|f32>]\n"
         "                         [--mel-base10] [--mel-min X] [--mel-max X]\n"
-        "                         [--seed N] [--noise-scale X] [--backend cpu|gpu|auto]\n"
+        "                         [--seed N] [--noise-scale X] [--backend cpu|gpu|auto|cuda[:N]|vulkan[:N]]\n"
+        "                         [--threads N|auto]\n"
         "\n"
         "mel-bin is raw float32 [T, num_mels] row-major. f0-bin is raw float32 [T] in Hz.\n"
         "Outputs PCM16 WAV when --out ends with .wav, otherwise raw float32 samples.\n");
@@ -150,6 +151,7 @@ int main(int argc, char ** argv) {
         else if (a == "--seed") seed = (uint32_t)std::strtoul(next().c_str(), nullptr, 10);
         else if (a == "--noise-scale") noise_scale = (float)std::atof(next().c_str());
         else if (a == "--backend") dsrt::set_backend_mode(next().c_str());
+        else if (a == "--threads") dsrt::set_runtime_threads(next().c_str());
         else if (a == "--precision") {
             std::string m = next();
             if (m == "f16" || m == "fp16") dsrt::set_precision(dsrt::Precision::F16);

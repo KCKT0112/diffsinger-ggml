@@ -125,6 +125,13 @@ def add_scalar_metadata(gw: gguf.GGUFWriter, cfg: dict[str, Any], sd: dict[str, 
     gw.add_uint32(f"{ARCH}.num_lang", int(sd.get("fs2.lang_embed.weight", np.zeros((0,))).shape[0]))
 
     gw.add_bool(f"{ARCH}.predict_dur", bool(cfg.get("predict_dur", False)))
+    if bool(cfg.get("predict_dur", False)):
+        dur_args = cfg.get("dur_prediction_args", {})
+        gw.add_uint32(f"{ARCH}.dur_predictor.hidden_size", int(dur_args.get("hidden_size", 0)))
+        gw.add_uint32(f"{ARCH}.dur_predictor.num_layers", int(dur_args.get("num_layers", 0)))
+        gw.add_uint32(f"{ARCH}.dur_predictor.kernel_size", int(dur_args.get("kernel_size", 0)))
+        gw.add_float32(f"{ARCH}.dur_predictor.log_offset", float(dur_args.get("log_offset", 1.0)))
+        gw.add_string(f"{ARCH}.dur_predictor.loss_type", str(dur_args.get("loss_type", "mse")))
     for name in ("energy", "breathiness", "voicing", "tension"):
         gw.add_bool(f"{ARCH}.predict_{name}", bool(cfg.get(f"predict_{name}", False)))
 

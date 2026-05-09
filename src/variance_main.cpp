@@ -14,6 +14,9 @@ static void usage() {
         "                           [--ph2word-bin <i32> --word-dur-bin <f32>]\n"
         "                           [--mel2ph-bin <i32> --phones <L> --frames <T>]\n"
         "                           [--lang-bin <i32>] [--spk-id <id>] --out <cond.f32>\n"
+        "                           [--predict-duration --tokens-bin <i32> --ph2word-bin <i32>]\n"
+        "                           [--word-dur-bin <f32> --midi-bin <i32> --out-ph-dur <f32>]\n"
+        "                           [--out-ph-dur-int <i32>] [--out-mel2ph <i32>]\n"
         "                           [--variance-cond --fs2-cond-bin <f32> --pitch-bin <f32> --out <cond.f32>]\n"
         "                           [--sample-variance --cond-bin <cond.f32> --frames <T>]\n"
         "                           [--sample-variance --fs2-cond-bin <f32> --pitch-bin <f32> --frames <T>]\n"
@@ -21,7 +24,8 @@ static void usage() {
         "                           [--ph2word-bin <i32> --word-dur-bin <f32> --pitch-bin <f32>]\n"
         "                           [--out-breathiness <f32> --out-voicing <f32> --out-tension <f32>]\n"
         "                           [--out-energy <f32>] [--seed <u32>]\n"
-        "                           [--backend cpu|gpu|auto]\n"
+        "                           [--backend cpu|gpu|auto|cuda[:N]|vulkan[:N]]\n"
+        "                           [--threads N|auto]\n"
         "\n"
         "All modes are for the current word-duration variance checkpoint. Pitch must be\n"
         "provided as frame-level MIDI via --pitch-bin; this tool no longer predicts pitch.\n");
@@ -74,6 +78,18 @@ static bool write_f32_file(const std::string & path, const std::vector<float> & 
         return false;
     }
     f.write(reinterpret_cast<const char *>(out.data()), (std::streamsize)out.size() * 4);
+    return (bool)f;
+}
+
+static bool write_i32_file(const std::string & path, const std::vector<int32_t> & out) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        fprintf(stderr, "[err] write failed: %s\n", path.c_str());
+        return false;
+    }
+    if (!out.empty()) {
+        f.write(reinterpret_cast<const char *>(out.data()), (std::streamsize)out.size() * 4);
+    }
     return (bool)f;
 }
 
@@ -143,10 +159,14 @@ int main(int argc, char ** argv) {
     std::string word_dur_path;
     std::string lang_path;
     std::string mel2ph_path;
+    std::string midi_path;
     std::string fs2_cond_path;
     std::string pitch_path;
     std::string cond_path;
     std::string out_path;
+    std::string out_ph_dur_path;
+    std::string out_ph_dur_int_path;
+    std::string out_mel2ph_path;
     std::string out_energy_path;
     std::string out_breathiness_path;
     std::string out_voicing_path;
@@ -157,6 +177,7 @@ int main(int argc, char ** argv) {
     uint32_t seed = 1234;
     bool inspect = false;
     bool fs2_cond = false;
+    bool predict_duration = false;
     bool variance_cond = false;
     bool sample_variance_flag = false;
     bool infer_variance = false;
@@ -173,6 +194,7 @@ int main(int argc, char ** argv) {
         if (a == "--model") model_path = next();
         else if (a == "--inspect") inspect = true;
         else if (a == "--fs2-cond") fs2_cond = true;
+        else if (a == "--predict-duration") predict_duration = true;
         else if (a == "--variance-cond") variance_cond = true;
         else if (a == "--sample-variance") sample_variance_flag = true;
         else if (a == "--infer-variance") infer_variance = true;
@@ -181,12 +203,14 @@ int main(int argc, char ** argv) {
         else if (a == "--word-dur-bin") word_dur_path = next();
         else if (a == "--lang-bin") lang_path = next();
         else if (a == "--mel2ph-bin") mel2ph_path = next();
+        else if (a == "--midi-bin") midi_path = next();
         else if (a == "--fs2-cond-bin") fs2_cond_path = next();
         else if (a == "--pitch-bin") pitch_path = next();
         else if (a == "--phones") phones = std::atoi(next().c_str());
         else if (a == "--spk-id") spk_id = std::atoi(next().c_str());
         else if (a == "--seed") seed = (uint32_t)std::strtoul(next().c_str(), nullptr, 10);
         else if (a == "--backend") dsrt::set_backend_mode(next().c_str());
+        else if (a == "--threads") dsrt::set_runtime_threads(next().c_str());
         else if (a == "--precision") {
             std::string m = next();
             if (m == "f16" || m == "fp16") dsrt::set_precision(dsrt::Precision::F16);
@@ -195,6 +219,9 @@ int main(int argc, char ** argv) {
         else if (a == "--cond-bin") cond_path = next();
         else if (a == "--frames") frames = std::atoi(next().c_str());
         else if (a == "--out") out_path = next();
+        else if (a == "--out-ph-dur") out_ph_dur_path = next();
+        else if (a == "--out-ph-dur-int") out_ph_dur_int_path = next();
+        else if (a == "--out-mel2ph") out_mel2ph_path = next();
         else if (a == "--out-energy") out_energy_path = next();
         else if (a == "--out-breathiness") out_breathiness_path = next();
         else if (a == "--out-voicing") out_voicing_path = next();
@@ -267,6 +294,31 @@ int main(int argc, char ** argv) {
         if (!write_f32_file(out_path, out.condition)) return 1;
         fprintf(stderr, "[ok] wrote %s frames=%d hidden=%d\n",
                 out_path.c_str(), out.frames, out.hidden);
+    }
+
+    if (predict_duration) {
+        if (tokens_path.empty() || ph2word_path.empty() || word_dur_path.empty() ||
+            midi_path.empty() || out_ph_dur_path.empty()) {
+            fprintf(stderr, "[err] --predict-duration requires tokens, ph2word, word_dur, midi and --out-ph-dur\n");
+            usage();
+            return 2;
+        }
+        dsv::DurationInputs in;
+        in.phones = phones;
+        in.spk_id = spk_id;
+        if (!read_i32_file(tokens_path, in.tokens)) return 1;
+        if (!read_i32_file(ph2word_path, in.ph2word)) return 1;
+        if (!read_f32_file(word_dur_path, in.word_dur)) return 1;
+        if (!read_i32_file(midi_path, in.midi)) return 1;
+        if (!lang_path.empty() && !read_i32_file(lang_path, in.languages)) return 1;
+        if (in.phones == 0) in.phones = (int)in.tokens.size();
+        dsv::DurationOutputs out;
+        if (!dsv::predict_durations(model, in, out)) return 1;
+        if (!write_f32_file(out_ph_dur_path, out.ph_dur)) return 1;
+        if (!out_ph_dur_int_path.empty() && !write_i32_file(out_ph_dur_int_path, out.ph_dur_int)) return 1;
+        if (!out_mel2ph_path.empty() && !write_i32_file(out_mel2ph_path, out.mel2ph)) return 1;
+        fprintf(stderr, "[ok] wrote duration prediction phones=%d frames=%zu\n",
+                out.phones, out.mel2ph.size());
     }
 
     if (variance_cond) {

@@ -57,6 +57,11 @@ struct Config {
     uint32_t vocab_size = 0;
     uint32_t num_spk = 0;
     uint32_t num_lang = 0;
+    uint32_t audio_sample_rate = 44100;
+    uint32_t hop_size = 512;
+    bool use_glide_embed = false;
+    float glide_embed_scale = 1.0f;
+    float midi_smooth_width = 0.12f;
 
     // Melody encoder
     uint32_t melody_hidden_size = 128;
@@ -102,11 +107,17 @@ struct PitchInputs {
     // Melody inputs
     std::vector<float>   note_midi;      // [N], MIDI pitch (-1 = pad)
     std::vector<int32_t> note_rest;      // [N], 0/1
+    std::vector<int32_t> note_glide;     // [N], glide id (0 = none)
     std::vector<int32_t> note_dur;       // [N], duration in frames
     std::vector<int32_t> mel2note;       // [T], 1-based note index
 
     // Base pitch for delta computation (from note_seq expansion)
     std::vector<float>   base_pitch;     // [T], MIDI semitones
+
+    // Optional retake-aware conditioning inputs
+    std::vector<float>   pitch;          // [T], existing pitch MIDI for partial retake
+    std::vector<float>   pitch_expr;     // [T], optional expression mask
+    std::vector<int32_t> pitch_retake;   // [T], 0/1
 };
 
 struct PitchOutputs {

@@ -126,6 +126,18 @@ static std::vector<int32_t> frames_from_seconds(const std::vector<float> & durat
     return frames;
 }
 
+static std::vector<int32_t> build_mel2x_from_frames(const std::vector<int32_t> & frames) {
+    int total = 0;
+    for (int32_t v : frames) total += std::max<int32_t>(v, 0);
+    std::vector<int32_t> out;
+    out.reserve((size_t)total);
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const int32_t len = std::max<int32_t>(frames[i], 0);
+        for (int32_t k = 0; k < len; ++k) out.push_back((int32_t)i + 1);
+    }
+    return out;
+}
+
 // resample_align_curve: linear interpolation from one time grid to another
 static std::vector<float> resample_align_curve(const std::vector<float> & points,
                                                float original_timestep,
@@ -180,6 +192,46 @@ static float note_to_midi(const std::string & note) {
     return (float)((octave + 1) * 12 + base);
 }
 
+static void interpolate_rest_notes(std::vector<float> & note_midi,
+                                   const std::vector<int32_t> & note_rest) {
+    if (note_midi.empty()) return;
+    int first_voiced = -1;
+    for (size_t i = 0; i < note_midi.size(); ++i) {
+        if (i < note_rest.size() && note_rest[i] == 0 && note_midi[i] >= 0.0f) {
+            first_voiced = (int)i;
+            break;
+        }
+    }
+    if (first_voiced < 0) {
+        std::fill(note_midi.begin(), note_midi.end(), 60.0f);
+        return;
+    }
+
+    int last_voiced = first_voiced;
+    for (int i = 0; i < (int)note_midi.size(); ++i) {
+        if (i < (int)note_rest.size() && note_rest[(size_t)i] == 0 && note_midi[(size_t)i] >= 0.0f) {
+            last_voiced = i;
+        } else if (i < first_voiced) {
+            note_midi[(size_t)i] = note_midi[(size_t)first_voiced];
+        } else if (i > last_voiced) {
+            note_midi[(size_t)i] = note_midi[(size_t)last_voiced];
+        }
+    }
+
+    int prev = first_voiced;
+    for (int i = first_voiced + 1; i < (int)note_midi.size(); ++i) {
+        if (i < (int)note_rest.size() && note_rest[(size_t)i] == 0 && note_midi[(size_t)i] >= 0.0f) {
+            for (int j = prev + 1; j < i; ++j) {
+                note_midi[(size_t)j] = note_midi[(size_t)prev];
+            }
+            prev = i;
+        }
+    }
+    for (int j = prev + 1; j < (int)note_midi.size(); ++j) {
+        note_midi[(size_t)j] = note_midi[(size_t)prev];
+    }
+}
+
 // hz_to_midi with unvoiced interpolation
 static std::vector<float> hz_to_midi(const std::vector<float> & f0_hz) {
     const int T = (int)f0_hz.size();
@@ -231,6 +283,29 @@ static std::vector<float> hz_to_midi(const std::vector<float> & f0_hz) {
     return midi;
 }
 
+static std::vector<int32_t> average_midi_per_index(const std::vector<float> & frame_midi,
+                                                   const std::vector<int32_t> & mel2x,
+                                                   int count) {
+    std::vector<double> sum((size_t)count, 0.0);
+    std::vector<int32_t> n((size_t)count, 0);
+    const int T = std::min((int)frame_midi.size(), (int)mel2x.size());
+    for (int t = 0; t < T; ++t) {
+        const int idx = mel2x[(size_t)t];
+        if (idx <= 0 || idx > count) continue;
+        sum[(size_t)(idx - 1)] += (double)frame_midi[(size_t)t];
+        n[(size_t)(idx - 1)] += 1;
+    }
+    std::vector<int32_t> out((size_t)count, 60);
+    for (int i = 0; i < count; ++i) {
+        if (n[(size_t)i] > 0) {
+            out[(size_t)i] = (int32_t)std::lround(sum[(size_t)i] / (double)n[(size_t)i]);
+        } else if (i > 0) {
+            out[(size_t)i] = out[(size_t)i - 1];
+        }
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Main .ds parser
 // ---------------------------------------------------------------------------
@@ -275,17 +350,11 @@ std::vector<DSSegment> parse_ds_file(const std::string & ds_path,
         if (seg.contains("offset")) out.offset = json_double(seg["offset"]);
 
         // ---- phonemes & durations ----
-        if (!seg.contains("ph_seq") || !seg.contains("ph_dur")) {
-            fprintf(stderr, "[err] segment %zu missing ph_seq/ph_dur\n", seg_idx);
+        if (!seg.contains("ph_seq")) {
+            fprintf(stderr, "[err] segment %zu missing ph_seq\n", seg_idx);
             return {};
         }
         auto phones = split_string(seg["ph_seq"].get<std::string>());
-        auto ph_dur_s = split_floats(seg["ph_dur"].get<std::string>());
-        if (phones.size() != ph_dur_s.size()) {
-            fprintf(stderr, "[err] segment %zu: phone/dur size mismatch (%zu vs %zu)\n",
-                    seg_idx, phones.size(), ph_dur_s.size());
-            return {};
-        }
         const int L = (int)phones.size();
 
         // Store raw phoneme names (for re-encoding with alternate phoneme maps)
@@ -302,21 +371,21 @@ std::vector<DSSegment> parse_ds_file(const std::string & ds_path,
             out.tokens[i] = id;
         }
 
-        // Compute frame durations
-        auto ph_frames = frames_from_seconds(ph_dur_s, sr, hop);
+        const bool have_manual_ph_dur = seg.contains("ph_dur") && !seg["ph_dur"].is_null();
+        std::vector<int32_t> ph_frames;
         int T = 0;
-        for (int32_t fr : ph_frames) T += fr;
-
-        // Store per-phone frame durations
-        out.ph_dur.resize(L);
-        for (int i = 0; i < L; ++i) out.ph_dur[i] = (float)ph_frames[i];
-
-        // mel2ph
-        out.mel2ph.reserve(T);
-        for (int i = 0; i < L; ++i) {
-            for (int32_t k = 0; k < ph_frames[i]; ++k) {
-                out.mel2ph.push_back(i + 1);  // 1-based
+        if (have_manual_ph_dur) {
+            auto ph_dur_s = split_floats(seg["ph_dur"].get<std::string>());
+            if (phones.size() != ph_dur_s.size()) {
+                fprintf(stderr, "[err] segment %zu: phone/dur size mismatch (%zu vs %zu)\n",
+                        seg_idx, phones.size(), ph_dur_s.size());
+                return {};
             }
+            ph_frames = frames_from_seconds(ph_dur_s, sr, hop);
+            for (int32_t fr : ph_frames) T += fr;
+            out.ph_dur.resize(L);
+            for (int i = 0; i < L; ++i) out.ph_dur[i] = (float)ph_frames[i];
+            out.mel2ph = build_mel2x_from_frames(ph_frames);
         }
 
         // ---- ph2word & word_dur ----
@@ -341,10 +410,12 @@ std::vector<DSSegment> parse_ds_file(const std::string & ds_path,
         }
         // word_dur: sum ph_frames per word
         out.word_dur.assign(W, 0.0f);
-        ph_idx = 0;
-        for (int w = 0; w < W; ++w) {
-            for (int k = 0; k < ph_num[w]; ++k) {
-                out.word_dur[w] += (float)ph_frames[ph_idx++];
+        if (have_manual_ph_dur) {
+            ph_idx = 0;
+            for (int w = 0; w < W; ++w) {
+                for (int k = 0; k < ph_num[w]; ++k) {
+                    out.word_dur[w] += (float)ph_frames[ph_idx++];
+                }
             }
         }
 
@@ -355,10 +426,27 @@ std::vector<DSSegment> parse_ds_file(const std::string & ds_path,
 
             out.note_midi.resize(N);
             out.note_rest.resize(N);
+            out.note_glide.assign(N, 0);
             for (int n = 0; n < N; ++n) {
                 float midi = note_to_midi(notes[n]);
                 out.note_midi[n] = midi;
                 out.note_rest[n] = (midi < 0.0f) ? 1 : 0;
+            }
+            interpolate_rest_notes(out.note_midi, out.note_rest);
+
+            if (seg.contains("note_glide") && !seg["note_glide"].is_null()) {
+                auto glide = split_string(seg["note_glide"].get<std::string>());
+                if ((int)glide.size() != N) {
+                    fprintf(stderr, "[err] segment %zu: note_glide size %zu != note_seq %d\n",
+                            seg_idx, glide.size(), N);
+                    return {};
+                }
+                for (int n = 0; n < N; ++n) {
+                    const std::string & value = glide[(size_t)n];
+                    if (value == "up") out.note_glide[(size_t)n] = 1;
+                    else if (value == "down") out.note_glide[(size_t)n] = 2;
+                    else out.note_glide[(size_t)n] = 0;
+                }
             }
 
             // note_dur: duration per note (in seconds)
@@ -372,6 +460,67 @@ std::vector<DSSegment> parse_ds_file(const std::string & ds_path,
                 auto note_frames = frames_from_seconds(note_dur_s, sr, hop);
                 out.note_dur_frames.resize(N);
                 for (int n = 0; n < N; ++n) out.note_dur_frames[n] = note_frames[n];
+                int note_total = 0;
+                for (int32_t fr : note_frames) note_total += fr;
+
+                if (have_manual_ph_dur && note_total > 0 && note_total != T) {
+                    if (out.mel2ph.empty()) {
+                        fprintf(stderr, "[err] segment %zu: cannot align ph_dur without mel2ph\n", seg_idx);
+                        return {};
+                    }
+                    if ((int)out.mel2ph.size() < note_total) {
+                        out.mel2ph.resize((size_t)note_total, out.mel2ph.back());
+                    } else if ((int)out.mel2ph.size() > note_total) {
+                        out.mel2ph.resize((size_t)note_total);
+                    }
+                    T = note_total;
+                    out.ph_dur.assign((size_t)L, 0.0f);
+                    for (int32_t p : out.mel2ph) {
+                        if (p > 0 && p <= L) out.ph_dur[(size_t)(p - 1)] += 1.0f;
+                    }
+                    out.word_dur.assign(W, 0.0f);
+                    for (int i = 0; i < L; ++i) {
+                        const int w = out.ph2word[(size_t)i];
+                        if (w > 0 && w <= W) out.word_dur[(size_t)(w - 1)] += out.ph_dur[(size_t)i];
+                    }
+                }
+
+                if (!have_manual_ph_dur) {
+                    T = 0;
+                    for (int32_t fr : note_frames) T += fr;
+                    if (seg.contains("note_slur") && !seg["note_slur"].is_null()) {
+                        auto note_slur = split_ints(seg["note_slur"].get<std::string>());
+                        if ((int)note_slur.size() != N) {
+                            fprintf(stderr, "[err] segment %zu: note_slur size %zu != note_seq %d\n",
+                                    seg_idx, note_slur.size(), N);
+                            return {};
+                        }
+                        out.word_dur.assign(W, 0.0f);
+                        int word_idx = -1;
+                        for (int n = 0; n < N; ++n) {
+                            if (note_slur[(size_t)n] == 0) ++word_idx;
+                            if (word_idx < 0 || word_idx >= W) {
+                                fprintf(stderr, "[err] segment %zu: note_slur does not align to ph_num words\n", seg_idx);
+                                return {};
+                            }
+                            out.word_dur[(size_t)word_idx] += (float)note_frames[(size_t)n];
+                        }
+                        if (word_idx + 1 != W) {
+                            fprintf(stderr, "[err] segment %zu: note_slur word count %d != ph_num words %d\n",
+                                    seg_idx, word_idx + 1, W);
+                            return {};
+                        }
+                    } else if (N == W) {
+                        out.word_dur.assign(W, 0.0f);
+                        for (int n = 0; n < N; ++n) {
+                            out.word_dur[(size_t)n] = (float)note_frames[(size_t)n];
+                        }
+                    } else {
+                        fprintf(stderr, "[err] segment %zu missing ph_dur; note_dur requires note_slur unless notes==words\n",
+                                seg_idx);
+                        return {};
+                    }
+                }
 
                 // mel2note: expand note durations to frame-level index [T]
                 out.mel2note.resize(T, 0);
@@ -389,26 +538,39 @@ std::vector<DSSegment> parse_ds_file(const std::string & ds_path,
                 // Fallback: notes = words, use word durations
                 out.note_dur_frames.resize(N);
                 for (int n = 0; n < N; ++n) {
-                    out.note_dur_frames[n] = (int32_t)out.word_dur[n];
+                    out.note_dur_frames[n] = (int32_t)std::lround(out.word_dur[(size_t)n]);
+                }
+                if (!have_manual_ph_dur) {
+                    T = 0;
+                    for (int n = 0; n < N; ++n) T += out.note_dur_frames[(size_t)n];
                 }
                 out.mel2note.resize(T);
                 int frame_pos = 0;
-                ph_idx = 0;
-                for (int w = 0; w < W; ++w) {
-                    for (int k = 0; k < ph_num[w]; ++k) {
-                        for (int32_t fr = 0; fr < ph_frames[ph_idx]; ++fr) {
+                if (have_manual_ph_dur) {
+                    ph_idx = 0;
+                    for (int w = 0; w < W; ++w) {
+                        for (int k = 0; k < ph_num[w]; ++k) {
+                            for (int32_t fr = 0; fr < ph_frames[ph_idx]; ++fr) {
+                                out.mel2note[frame_pos++] = w + 1;
+                            }
+                            ph_idx++;
+                        }
+                    }
+                } else {
+                    for (int w = 0; w < W && frame_pos < T; ++w) {
+                        for (int32_t fr = 0; fr < out.note_dur_frames[(size_t)w] && frame_pos < T; ++fr) {
                             out.mel2note[frame_pos++] = w + 1;
                         }
-                        ph_idx++;
                     }
+                    for (; frame_pos < T; ++frame_pos) out.mel2note[(size_t)frame_pos] = N;
                 }
             }
 
-            // base_pitch: expand note_midi to frame level via mel2note
+            // base_pitch: expand rest-interpolated note_midi to frame level via mel2note
             out.base_pitch.resize(T);
             for (int i = 0; i < T; ++i) {
                 int ni = out.mel2note[i] - 1;  // 0-based
-                if (ni >= 0 && ni < N && out.note_midi[ni] > 0.0f) {
+                if (ni >= 0 && ni < N) {
                     out.base_pitch[i] = out.note_midi[ni];
                 } else {
                     out.base_pitch[i] = 0.0f;
@@ -440,6 +602,20 @@ std::vector<DSSegment> parse_ds_file(const std::string & ds_path,
 
         // ---- pitch_midi (from f0_hz) ----
         out.pitch_midi = hz_to_midi(out.f0_hz);
+
+        if (have_manual_ph_dur) {
+            out.midi = average_midi_per_index(out.base_pitch, out.mel2ph, L);
+        } else {
+            std::vector<int32_t> word_frames(W);
+            for (int w = 0; w < W; ++w) word_frames[(size_t)w] = (int32_t)std::lround(out.word_dur[(size_t)w]);
+            std::vector<int32_t> mel2word = build_mel2x_from_frames(word_frames);
+            std::vector<int32_t> word_midi = average_midi_per_index(out.base_pitch, mel2word, W);
+            out.midi.resize((size_t)L, 60);
+            for (int i = 0; i < L; ++i) {
+                const int w = out.ph2word[(size_t)i];
+                out.midi[(size_t)i] = (w > 0 && w <= W) ? word_midi[(size_t)(w - 1)] : 60;
+            }
+        }
 
         // ---- languages (all zeros) ----
         out.languages.assign(L, 0);

@@ -65,10 +65,10 @@ static ggml_tensor * conv1d_k1_as_linear(ggml_context * ctx,
 
 static ggml_tensor * atanglu(ggml_context * ctx, ggml_tensor * x) {
     const int64_t c = x->ne[0] / 2;
-    ggml_tensor * out = ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], 0);
-    ggml_tensor * gate = ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], c * x->nb[0]);
+    ggml_tensor * out = ggml_cont(ctx, ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], 0));
+    ggml_tensor * gate = ggml_cont(ctx, ggml_view_2d(ctx, x, c, x->ne[1], x->nb[1], c * x->nb[0]));
     // out * atan(gate) using branchless polynomial approximation that runs
-    // on Metal/CPU/CUDA via stock ggml ops.
+    // on Metal/CPU/CUDA/Vulkan via stock ggml ops.
     //   sx = sign(gate)
     //   ax = |gate|
     //   big = step(ax - 1)   (1 if ax > 1 else 0)
@@ -915,6 +915,8 @@ bool run_inference(const Model & m, const InferenceInputs & in, InferenceOutputs
     };
 
     const std::string alg = in.algorithm_override.empty() ? c.sampling_algorithm : in.algorithm_override;
+    std::vector<float> x_tmp(x_t.size());
+    std::vector<float> k1, k2, k3;
     for (int i = 0; i < n; ++i) {
         float t_i = t_start + (float)i * dt;
 
@@ -922,25 +924,23 @@ bool run_inference(const Model & m, const InferenceInputs & in, InferenceOutputs
             // Midpoint method: k1 = v(x, t); x_mid = x + dt/2*k1;
             //                  k2 = v(x_mid, t+dt/2); x += dt*k2
             if (!eval_velocity(x_t, t_i)) goto compute_fail;
-            std::vector<float> x_mid(x_t.size());
             for (size_t k = 0; k < x_t.size(); ++k)
-                x_mid[k] = x_t[k] + 0.5f * dt * v_host[k];
-            if (!eval_velocity(x_mid, t_i + 0.5f * dt)) goto compute_fail;
+                x_tmp[k] = x_t[k] + 0.5f * dt * v_host[k];
+            if (!eval_velocity(x_tmp, t_i + 0.5f * dt)) goto compute_fail;
             for (size_t k = 0; k < x_t.size(); ++k)
                 x_t[k] += dt * v_host[k];
         } else if (alg == "rk4") {
             // Classic 4th-order Runge-Kutta
             if (!eval_velocity(x_t, t_i)) goto compute_fail;
-            std::vector<float> k1(v_host);
-            std::vector<float> x_tmp(x_t.size());
+            k1 = v_host;
             for (size_t k = 0; k < x_t.size(); ++k)
                 x_tmp[k] = x_t[k] + 0.5f * dt * k1[k];
             if (!eval_velocity(x_tmp, t_i + 0.5f * dt)) goto compute_fail;
-            std::vector<float> k2(v_host);
+            k2 = v_host;
             for (size_t k = 0; k < x_t.size(); ++k)
                 x_tmp[k] = x_t[k] + 0.5f * dt * k2[k];
             if (!eval_velocity(x_tmp, t_i + 0.5f * dt)) goto compute_fail;
-            std::vector<float> k3(v_host);
+            k3 = v_host;
             for (size_t k = 0; k < x_t.size(); ++k)
                 x_tmp[k] = x_t[k] + dt * k3[k];
             if (!eval_velocity(x_tmp, t_i + dt)) goto compute_fail;
