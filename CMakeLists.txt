@@ -304,3 +304,14 @@ add_executable(diffsinger_pipeline
 target_include_directories(diffsinger_pipeline PRIVATE include)
 target_link_libraries(diffsinger_pipeline PRIVATE ggml nlohmann_json::nlohmann_json)
 target_compile_options(diffsinger_pipeline PRIVATE ${DS_WARN_FLAGS})
+
+# ----------------------------------------------------------------------------
+# Tests
+# ----------------------------------------------------------------------------
+option(DSGGML_BUILD_TESTS "Build unit tests" OFF)
+if(DSGGML_BUILD_TESTS)
+    enable_testing()
+    add_executable(dsggml_tests tests/test_main.cpp)
+    target_compile_options(dsggml_tests PRIVATE ${DS_WARN_FLAGS})
+    add_test(NAME dsggml_tests COMMAND dsggml_tests)
+endif()

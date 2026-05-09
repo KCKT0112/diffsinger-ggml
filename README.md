@@ -127,6 +127,29 @@ instead of using the `.ds` file's `f0_seq`:
 - `--pitch-phonemes` provides the pitch model's phoneme map (required when pitch model has different vocabulary)
 - `--auto-pitch` forces pitch prediction even when the .ds file has `f0_seq`
 
+### Duration Prediction (auto phoneme timing)
+
+When a `.ds` file lacks `ph_dur`, the pipeline can predict phoneme durations
+using the variance model's built-in duration predictor:
+
+```bash
+./build/diffsinger_pipeline \
+  --variance-model assets/zhibin_variance.gguf \
+  --acoustic-model assets/zhibin_acoustic.gguf \
+  --vocoder-model assets/pc_nsf_hifigan.gguf \
+  --ds input.ds \
+  --phonemes assets/phonemes.json \
+  --spk-id 0 \
+  --auto-duration \
+  --steps 5 --algorithm midpoint \
+  --out output.wav
+```
+
+- `--auto-duration` enables duration prediction for segments missing `ph_dur`
+- The duration predictor uses the variance model's FS2 word encoder + 5-layer Conv1d predictor
+- Predicted durations are aligned to `note_dur` via a rhythm regulator
+- Segments that already have `ph_dur` in the `.ds` file are unaffected
+
 ### Pipeline Options
 
 | Flag | Description |
@@ -136,6 +159,8 @@ instead of using the `.ds` file's `f0_seq`:
 | `--seed N` | RNG seed for diffusion noise |
 | `--spk-id N` / `--spk-name NAME` | Speaker selection |
 | `--spk-map PATH` | Speaker name→id JSON (required with `--spk-name`) |
+| `--auto-duration` | Predict phoneme durations when `.ds` file lacks `ph_dur` |
+| `--auto-pitch` | Predict F0 even when `.ds` file has `f0_seq` |
 | `--predict-all-variances` | Overwrite existing variance curves from .ds |
 | `--precision f32\|f16` | Weight precision (default: f32, see below) |
 | `--backend cpu\|gpu\|auto\|cuda[:N]\|vulkan[:N]` | Global compute backend |
@@ -174,9 +199,13 @@ already the smallest and fastest component. The GGUF files should remain F32 for
   discoverable. Run with
   `--backend vulkan` for device 0 or `--backend vulkan:N` for device N.
   `--backend gpu` also selects the first registered discrete GPU.
-- **Metal**: all ops are Metal-native, but ~38s cold JIT compilation cost.
-  Only worthwhile for long-running servers that amortize the JIT.
-  Recommended: keep vocoder on CPU regardless.
+- **Metal**: all ops are Metal-native. The build pre-compiles a `default.metallib`
+  at build time (requires Xcode Metal Toolchain), eliminating the ~7s cold-start
+  JIT compilation. A `MTLBinaryArchive` PSO cache (`~/.cache/ggml/pipelines.metallib`)
+  further accelerates subsequent launches by caching compiled GPU pipeline states.
+  Override the cache path with `GGML_METAL_ARCHIVE_PATH`.
+  Recommended: keep vocoder on CPU (its `conv_transpose_1d` monopolizes the GPU
+  and can stall system UI on Apple Silicon's shared GPU).
 
 ### Recommended Settings
 
@@ -236,7 +265,9 @@ Run vocoder from mel:
   --out out.wav
 ```
 
-## Performance (Apple Silicon M4, CPU, F32)
+## Performance (Apple Silicon M4, F32)
+
+### CPU only (4 threads)
 
 | Component | T=333 frames | Notes |
 |-----------|-------------|-------|
@@ -245,6 +276,15 @@ Run vocoder from mel:
 | Acoustic (midpoint-5) | ~1.8s | shallow diffusion with aux decoder |
 | Vocoder | ~0.3s | NSF-HiFiGAN |
 | **Total per segment** | **~5.4s** | For ~3.9s of audio (T=333) |
+
+### Metal GPU (variance/acoustic/pitch on GPU, vocoder on CPU)
+
+| Metric | Value |
+|--------|-------|
+| Full song (26 segments, 263.8s audio) | 113s wall time |
+| Real-time ratio | 2.3x real-time |
+| Metal library load | 0.001s (pre-compiled metallib) |
+| PSO cache | `~/.cache/ggml/pipelines.metallib` (688 KB) |
 
 CPU thread count is auto-selected by default. Override examples:
 `DSGGML_THREADS=16`, `--threads 16`, or `--threads auto`.
@@ -302,3 +342,4 @@ For debugging/validation against PyTorch:
 | `DSDIAG_PITCH_NOISE` | pitch | Load fixed pitch noise |
 | `DSGGML_THREADS` | all | Override CPU thread count; positive integer, `0`, or `auto` |
 | `DSGGML_BACKEND_*` | all | Per-component backend (VARIANCE/ACOUSTIC/VOCODER/PITCH), supports `cpu`, `gpu`, `auto`, `cuda[:N]`, and `vulkan[:N]` |
+| `GGML_METAL_ARCHIVE_PATH` | Metal | Override PSO binary archive path (default: `~/.cache/ggml/pipelines.metallib`) |

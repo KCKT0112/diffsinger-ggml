@@ -1,0 +1,53 @@
+name: Build & Test
+
+on:
+  push:
+    paths:
+      - 'diffsinger-ggml/**'
+  pull_request:
+    paths:
+      - 'diffsinger-ggml/**'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: macOS-arm64
+            cmake_extra: ""
+          - os: ubuntu-22.04
+            name: Linux-x64
+            cmake_extra: ""
+          - os: windows-2022
+            name: Windows-x64
+            cmake_extra: ""
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S diffsinger-ggml -B diffsinger-ggml/build
+          -DCMAKE_BUILD_TYPE=Release
+          -DDSGGML_BUILD_TESTS=ON
+          ${{ matrix.cmake_extra }}
+
+      - name: Build
+        run: cmake --build diffsinger-ggml/build --config Release -j 4
+
+      - name: Test
+        working-directory: diffsinger-ggml/build
+        run: ctest --build-config Release --output-on-failure
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffsinger-ggml-${{ matrix.name }}
+          path: |
+            diffsinger-ggml/build/bin/
+          if-no-files-found: warn
